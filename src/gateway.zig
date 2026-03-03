@@ -29,6 +29,7 @@ const security_audit = @import("security/audit.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
+const log = std.log.scoped(.gateway);
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -2544,6 +2545,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                         .enabled = cfg.security.audit.enabled,
                         .log_path = cfg.security.audit.log_path,
                         .max_size_mb = cfg.security.audit.max_size_mb,
+                        .capture_shell_output = cfg.security.audit.capture_shell_output,
+                        .max_output_bytes = cfg.security.audit.max_output_bytes,
                     }, cfg.workspace_dir) catch |err| blk: {
                         log.warn("audit logger init failed: {}", .{err});
                         break :blk null;
@@ -2577,6 +2580,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .policy = if (sec_policy_opt) |*policy| policy else null,
                     .audit_logger = if (audit_logger_opt) |*logger| logger else null,
                     .audit_channel = "runtime",
+                    .audit_capture_shell_output = cfg.security.audit.capture_shell_output,
+                    .audit_max_output_bytes = @intCast(cfg.security.audit.max_output_bytes),
                     .subagent_manager = subagent_manager_opt,
                 }) catch &.{};
 

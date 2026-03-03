@@ -1682,6 +1682,8 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
             .enabled = config.security.audit.enabled,
             .log_path = config.security.audit.log_path,
             .max_size_mb = config.security.audit.max_size_mb,
+            .capture_shell_output = config.security.audit.capture_shell_output,
+            .max_output_bytes = config.security.audit.max_output_bytes,
         }, config.workspace_dir) catch |err| blk: {
             std.debug.print("  Audit logger init failed: {}\n", .{err});
             break :blk null;
@@ -1712,6 +1714,8 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .policy = &sec_policy,
         .audit_logger = if (audit_logger_opt) |*logger| logger else null,
         .audit_channel = "signal",
+        .audit_capture_shell_output = config.security.audit.capture_shell_output,
+        .audit_max_output_bytes = @intCast(config.security.audit.max_output_bytes),
         .subagent_manager = &subagent_manager,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
@@ -2007,6 +2011,8 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
             .enabled = config.security.audit.enabled,
             .log_path = config.security.audit.log_path,
             .max_size_mb = config.security.audit.max_size_mb,
+            .capture_shell_output = config.security.audit.capture_shell_output,
+            .max_output_bytes = config.security.audit.max_output_bytes,
         }, config.workspace_dir) catch |err| blk: {
             std.debug.print("  Audit logger init failed: {}\n", .{err});
             break :blk null;
@@ -2037,6 +2043,8 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .policy = &sec_policy,
         .audit_logger = if (audit_logger_opt) |*logger| logger else null,
         .audit_channel = "telegram",
+        .audit_capture_shell_output = config.security.audit.capture_shell_output,
+        .audit_max_output_bytes = @intCast(config.security.audit.max_output_bytes),
         .subagent_manager = &subagent_manager,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);

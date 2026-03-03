@@ -27,6 +27,8 @@ pub const ShellTool = struct {
     policy: ?*const SecurityPolicy = null,
     audit_logger: ?*const audit_mod.AuditLogger = null,
     audit_channel: []const u8 = "runtime",
+    audit_capture_output: bool = false,
+    audit_max_output_bytes: usize = 2048,
 
     pub const tool_name = "shell";
     pub const tool_description = "Execute a shell command in the workspace directory";
@@ -56,7 +58,7 @@ pub const ShellTool = struct {
             _ = pol.validateCommandExecution(command, false) catch |err| {
                 const elapsed_ms = elapsedMillis(started_ms);
                 risk_level = pol.commandRiskLevel(command).toString();
-                self.logCommandEvent(command, risk_level, false, false, false, elapsed_ms);
+                self.logCommandEvent(command, risk_level, false, false, false, elapsed_ms, null, null, false, false);
                 self.logPolicyViolationEvent(command, risk_level, elapsed_ms, @errorName(err));
                 return switch (err) {
                     error.CommandNotAllowed => ToolResult.fail("Command not allowed by security policy"),
@@ -113,14 +115,35 @@ pub const ShellTool = struct {
         });
         defer allocator.free(result.stderr);
         const elapsed_ms = elapsedMillis(started_ms);
+        const capture_output = self.audit_capture_output and self.audit_logger != null and self.audit_max_output_bytes > 0;
+
+        var audit_stdout: ?[]u8 = null;
+        var audit_stderr: ?[]u8 = null;
+        var stdout_truncated = false;
+        var stderr_truncated = false;
+        defer if (audit_stdout) |s| allocator.free(s);
+        defer if (audit_stderr) |s| allocator.free(s);
+
+        if (capture_output) {
+            if (result.stdout.len > 0) {
+                const capped = try sanitizeOutputForAudit(allocator, result.stdout, self.audit_max_output_bytes);
+                audit_stdout = capped.text;
+                stdout_truncated = capped.truncated;
+            }
+            if (result.stderr.len > 0) {
+                const capped = try sanitizeOutputForAudit(allocator, result.stderr, self.audit_max_output_bytes);
+                audit_stderr = capped.text;
+                stderr_truncated = capped.truncated;
+            }
+        }
 
         if (result.success) {
-            self.logCommandEvent(command, risk_level, false, true, true, elapsed_ms);
+            self.logCommandEvent(command, risk_level, false, true, true, elapsed_ms, audit_stdout, audit_stderr, stdout_truncated, stderr_truncated);
             if (result.stdout.len > 0) return ToolResult{ .success = true, .output = result.stdout };
             allocator.free(result.stdout);
             return ToolResult{ .success = true, .output = try allocator.dupe(u8, "(no output)") };
         }
-        self.logCommandEvent(command, risk_level, false, true, false, elapsed_ms);
+        self.logCommandEvent(command, risk_level, false, true, false, elapsed_ms, audit_stdout, audit_stderr, stdout_truncated, stderr_truncated);
         defer allocator.free(result.stdout);
         if (result.exit_code != null) {
             const err_out = try allocator.dupe(u8, if (result.stderr.len > 0) result.stderr else "Command failed with non-zero exit code");
@@ -143,6 +166,10 @@ pub const ShellTool = struct {
         allowed: bool,
         success: bool,
         duration_ms: u64,
+        stdout: ?[]const u8,
+        stderr: ?[]const u8,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
     ) void {
         const logger = self.audit_logger orelse return;
         logger.logCommand(.{
@@ -153,6 +180,10 @@ pub const ShellTool = struct {
             .allowed = allowed,
             .success = success,
             .duration_ms = duration_ms,
+            .stdout = stdout,
+            .stderr = stderr,
+            .stdout_truncated = stdout_truncated,
+            .stderr_truncated = stderr_truncated,
         }) catch {};
     }
 
@@ -170,6 +201,52 @@ pub const ShellTool = struct {
             .withResult(false, null, duration_ms, err_msg);
         event.security.policy_violation = true;
         logger.log(&event) catch {};
+    }
+
+    const SanitizedOutput = struct {
+        text: []u8,
+        truncated: bool,
+    };
+
+    fn sanitizeOutputForAudit(allocator: std.mem.Allocator, input: []const u8, max_bytes: usize) !SanitizedOutput {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        var truncated = false;
+
+        for (input) |c| {
+            if (out.items.len >= max_bytes) {
+                truncated = true;
+                break;
+            }
+            const mapped: u8 = switch (c) {
+                '\n', '\r', '\t' => c,
+                else => if (c < 0x20 or c == 0x7f) ' ' else c,
+            };
+            try out.append(allocator, mapped);
+        }
+
+        if (containsSensitiveContent(out.items)) {
+            return .{
+                .text = try allocator.dupe(u8, "[REDACTED_POTENTIAL_SECRET]"),
+                .truncated = false,
+            };
+        }
+        return .{
+            .text = try out.toOwnedSlice(allocator),
+            .truncated = truncated,
+        };
+    }
+
+    fn containsSensitiveContent(text: []const u8) bool {
+        return std.mem.indexOf(u8, text, "BEGIN PRIVATE KEY") != null or
+            std.mem.indexOf(u8, text, "BEGIN RSA PRIVATE KEY") != null or
+            std.mem.indexOf(u8, text, "Authorization: Bearer ") != null or
+            std.mem.indexOf(u8, text, "AWS_SECRET_ACCESS_KEY") != null or
+            std.mem.indexOf(u8, text, "OPENAI_API_KEY") != null or
+            std.mem.indexOf(u8, text, "ANTHROPIC_API_KEY") != null or
+            std.mem.indexOf(u8, text, "sk-or-") != null or
+            std.mem.indexOf(u8, text, "sk-ant-") != null or
+            std.mem.indexOf(u8, text, "sk-proj-") != null;
     }
 };
 
@@ -543,6 +620,76 @@ test "shell audit logger writes command execution events" {
     defer std.testing.allocator.free(content);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"event_type\":\"command_execution\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "audit-test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"stdout\"") == null);
+}
+
+test "shell audit logger captures stdout when enabled" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var logger = try audit_mod.AuditLogger.init(std.testing.allocator, .{
+        .enabled = true,
+        .log_path = "shell_audit_verbose.log",
+        .max_size_mb = 10,
+        .capture_shell_output = true,
+        .max_output_bytes = 8,
+    }, tmp_path);
+    defer logger.deinit();
+
+    var st = ShellTool{
+        .workspace_dir = tmp_path,
+        .audit_logger = &logger,
+        .audit_channel = "runtime",
+        .audit_capture_output = true,
+        .audit_max_output_bytes = 8,
+    };
+    const parsed = try root.parseTestArgs("{\"command\": \"printf 'abcdefghijklmnop'\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(result.success);
+
+    const content = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "shell_audit_verbose.log", 4096);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"stdout\":\"abcdefgh\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"stdout_truncated\":true") != null);
+}
+
+test "shell audit logger redacts sensitive stdout" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var logger = try audit_mod.AuditLogger.init(std.testing.allocator, .{
+        .enabled = true,
+        .log_path = "shell_audit_redact.log",
+        .max_size_mb = 10,
+        .capture_shell_output = true,
+        .max_output_bytes = 256,
+    }, tmp_path);
+    defer logger.deinit();
+
+    var st = ShellTool{
+        .workspace_dir = tmp_path,
+        .audit_logger = &logger,
+        .audit_channel = "runtime",
+        .audit_capture_output = true,
+        .audit_max_output_bytes = 256,
+    };
+    const parsed = try root.parseTestArgs("{\"command\": \"echo sk-or-secret-value\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(result.success);
+
+    const content = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "shell_audit_redact.log", 4096);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "[REDACTED_POTENTIAL_SECRET]") != null);
 }
 
 test "shell audit logger writes policy violation events" {

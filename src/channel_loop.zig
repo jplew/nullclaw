@@ -391,6 +391,8 @@ pub const ChannelRuntime = struct {
                 .enabled = config.security.audit.enabled,
                 .log_path = config.security.audit.log_path,
                 .max_size_mb = config.security.audit.max_size_mb,
+                .capture_shell_output = config.security.audit.capture_shell_output,
+                .max_output_bytes = config.security.audit.max_output_bytes,
             }, config.workspace_dir) catch |err| {
                 log.warn("audit logger init failed: {}", .{err});
                 allocator.destroy(logger);
@@ -422,6 +424,8 @@ pub const ChannelRuntime = struct {
             .policy = security_policy,
             .audit_logger = audit_logger,
             .audit_channel = "runtime",
+            .audit_capture_shell_output = config.security.audit.capture_shell_output,
+            .audit_max_output_bytes = @intCast(config.security.audit.max_output_bytes),
             .subagent_manager = subagent_manager,
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);

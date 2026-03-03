@@ -294,6 +294,8 @@ pub fn allTools(
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
         audit_logger: ?*const @import("../security/audit.zig").AuditLogger = null,
         audit_channel: []const u8 = "runtime",
+        audit_capture_shell_output: bool = false,
+        audit_max_output_bytes: usize = 2048,
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -316,6 +318,8 @@ pub fn allTools(
         .policy = opts.policy,
         .audit_logger = opts.audit_logger,
         .audit_channel = opts.audit_channel,
+        .audit_capture_output = opts.audit_capture_shell_output,
+        .audit_max_output_bytes = opts.audit_max_output_bytes,
     };
     try list.append(allocator, st.tool());
 
@@ -511,6 +515,8 @@ pub fn subagentTools(
         audit_logger: ?*const @import("../security/audit.zig").AuditLogger = null,
         audit_channel: []const u8 = "runtime",
         tools_config: @import("../config.zig").ToolsConfig = .{},
+        audit_capture_shell_output: bool = false,
+        audit_max_output_bytes: usize = 2048,
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -532,6 +538,8 @@ pub fn subagentTools(
         .policy = opts.policy,
         .audit_logger = opts.audit_logger,
         .audit_channel = opts.audit_channel,
+        .audit_capture_output = opts.audit_capture_shell_output,
+        .audit_max_output_bytes = opts.audit_max_output_bytes,
     };
     try list.append(allocator, st.tool());
 

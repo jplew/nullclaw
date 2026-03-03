@@ -217,6 +217,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             .enabled = cfg.security.audit.enabled,
             .log_path = cfg.security.audit.log_path,
             .max_size_mb = cfg.security.audit.max_size_mb,
+            .capture_shell_output = cfg.security.audit.capture_shell_output,
+            .max_output_bytes = cfg.security.audit.max_output_bytes,
         }, cfg.workspace_dir) catch |err| blk: {
             log.warn("audit logger init failed: {}", .{err});
             break :blk null;
@@ -251,6 +253,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .policy = &policy,
         .audit_logger = if (audit_logger_opt) |*logger| logger else null,
         .audit_channel = "cli",
+        .audit_capture_shell_output = cfg.security.audit.capture_shell_output,
+        .audit_max_output_bytes = @intCast(cfg.security.audit.max_output_bytes),
         .subagent_manager = &subagent_manager,
     });
     defer tools_mod.deinitTools(allocator, tools);
