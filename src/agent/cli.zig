@@ -8,6 +8,7 @@ const log = std.log.scoped(.agent);
 const Config = @import("../config.zig").Config;
 const providers = @import("../providers/root.zig");
 const Provider = providers.Provider;
+const http_util = @import("../http_util.zig");
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const memory_mod = @import("../memory/root.zig");
@@ -16,6 +17,7 @@ const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const subagent_mod = @import("../subagent.zig");
+const subagent_runner = @import("../subagent_runner.zig");
 const cli_mod = @import("../channels/cli.zig");
 const security = @import("../security/policy.zig");
 const security_audit = @import("../security/audit.zig");
@@ -152,6 +154,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         return;
     };
 
+    http_util.setProxyOverride(cfg.http_request.proxy) catch |err| {
+        log.err("Invalid http_request.proxy override: {s}", .{@errorName(err)});
+        return;
+    };
+    providers.setApiErrorLimitOverride(cfg.diagnostics.api_error_max_chars) catch |err| {
+        log.err("Invalid diagnostics.api_error_max_chars override: {s}", .{@errorName(err)});
+        return;
+    };
+
     // Ensure lifecycle parity: seed workspace files on first agent run
     // so prompts always have the expected bootstrap context.
     try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &onboard.ProjectContext{});
@@ -219,6 +230,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const resolved_api_key = runtime_provider.primaryApiKey();
 
     var subagent_manager = subagent_mod.SubagentManager.init(allocator, &cfg, null, .{});
+    subagent_manager.task_runner = subagent_runner.runTaskWithTools;
     defer subagent_manager.deinit();
 
     // Create tools (with agents config for delegate depth enforcement)

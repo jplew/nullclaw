@@ -3,6 +3,7 @@ const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
 const config_types = @import("../config_types.zig");
+const http_util = @import("../http_util.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -258,7 +259,7 @@ pub const AnthropicProvider = struct {
         const resp_body = if (is_oauth)
             curlPostOAuth(allocator, url, body, auth_hdr, version_hdr) catch return error.AnthropicApiError
         else
-            root.curlPost(allocator, url, body, &.{ auth_hdr, version_hdr }) catch return error.AnthropicApiError;
+            root.curlPostTimed(allocator, url, body, &.{ auth_hdr, version_hdr }, 0) catch return error.AnthropicApiError;
         defer allocator.free(resp_body);
 
         return parseTextResponse(allocator, resp_body);
@@ -539,11 +540,18 @@ fn buildStreamingChatRequestBody(
 fn curlPostOAuth(allocator: std.mem.Allocator, url: []const u8, body: []const u8, auth_hdr: []const u8, version_hdr: []const u8) ![]u8 {
     var argv = std.ArrayListUnmanaged([]const u8){};
     defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{ "curl", "-s", "-X", "POST" });
+
+    const proxy = http_util.getProxyFromEnv(allocator) catch null;
+    defer if (proxy) |p| allocator.free(p);
+    if (proxy) |p| {
+        try argv.appendSlice(allocator, &.{ "--proxy", p });
+    }
+
     try argv.appendSlice(allocator, &.{
-        "curl", "-s",                               "-X", "POST",
-        "-H",   "Content-Type: application/json",   "-H", auth_hdr,
-        "-H",   version_hdr,                        "-H", "anthropic-beta: oauth-2025-04-20",
-        "-A",   "claude-cli/2.1.2 (external, cli)", "-d", body,
+        "-H", "Content-Type: application/json",   "-H", auth_hdr,
+        "-H", version_hdr,                        "-H", "anthropic-beta: oauth-2025-04-20",
+        "-A", "claude-cli/2.1.2 (external, cli)", "-d", body,
         url,
     });
 

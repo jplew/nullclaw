@@ -145,9 +145,44 @@ fn findProviderInfoByCanonical(name: []const u8) ?ProviderInfo {
     return null;
 }
 
+fn hasVersionedApiSegment(url: []const u8) bool {
+    const proto_start = std.mem.indexOf(u8, url, "://") orelse return false;
+    var i: usize = proto_start + 3;
+    while (i + 2 < url.len) : (i += 1) {
+        if (url[i] != '/' or url[i + 1] != 'v') continue;
+        var j = i + 2;
+        var has_digit = false;
+        while (j < url.len and std.ascii.isDigit(url[j])) : (j += 1) {
+            has_digit = true;
+        }
+        if (!has_digit) continue;
+        if (j == url.len or (j < url.len and url[j] == '/')) return true;
+    }
+    return false;
+}
+
+fn isValidCustomProviderUrl(url: []const u8) bool {
+    if (url.len == 0) return false;
+    if (!(std.mem.startsWith(u8, url, "https://") or std.mem.startsWith(u8, url, "http://"))) return false;
+    return hasVersionedApiSegment(url);
+}
+
 /// Resolve a provider name used in quick setup.
 /// Accepts aliases (e.g. "grok" -> "xai") and returns provider metadata.
+/// Supports custom: prefix for OpenAI-compatible endpoints.
 pub fn resolveProviderForQuickSetup(name: []const u8) ?ProviderInfo {
+    // Support custom: prefix for OpenAI-compatible providers
+    if (std.mem.startsWith(u8, name, "custom:")) {
+        const custom_url = name["custom:".len..];
+        if (!isValidCustomProviderUrl(custom_url)) return null;
+        return .{
+            .key = name,
+            .label = "Custom OpenAI-compatible provider",
+            .default_model = "gpt-5.2",
+            .env_var = "API_KEY",
+        };
+    }
+
     const canonical = canonicalProviderName(name);
     return findProviderInfoByCanonical(canonical);
 }
@@ -348,8 +383,11 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
 
     // Determine URL, auth, and optional prefix filter
     var url: []const u8 = undefined;
+    var url_to_free: ?[]const u8 = null;
     var needs_auth = false;
     var prefix_filter: ?[]const u8 = null;
+    defer if (url_to_free) |u| allocator.free(u);
+
     if (std.mem.eql(u8, canonical, "openrouter")) {
         url = "https://openrouter.ai/api/v1/models";
         needs_auth = false; // OpenRouter models endpoint is public
@@ -360,6 +398,12 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
     } else if (std.mem.eql(u8, canonical, "groq")) {
         url = "https://api.groq.com/openai/v1/models";
         needs_auth = true;
+    } else if (std.mem.startsWith(u8, canonical, "http://") or std.mem.startsWith(u8, canonical, "https://")) {
+        // Custom OpenAI-compatible API endpoint
+        url_to_free = try buildModelsUrl(allocator, canonical);
+        url = url_to_free.?;
+        needs_auth = true;
+        // No prefix filter for custom endpoints
     } else {
         return error.FetchFailed;
     }
@@ -415,6 +459,26 @@ fn fetchAndParseModels(allocator: std.mem.Allocator, url: []const u8, headers: [
 
     if (result.items.len == 0) return error.FetchFailed;
     return result.toOwnedSlice(allocator);
+}
+
+/// Build the models endpoint URL for an OpenAI-compatible API.
+/// Given a base URL like "https://api.example.com/v1", returns "https://api.example.com/v1/models".
+/// If the URL already ends with "/models", returns a duplicate of the input.
+/// Caller owns the returned string.
+fn buildModelsUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]const u8 {
+    // Remove trailing slash if present
+    var url_to_use = base_url;
+    if (std.mem.endsWith(u8, base_url, "/")) {
+        url_to_use = base_url[0 .. base_url.len - 1];
+    }
+
+    // Check if URL already ends with /models (after removing trailing slash)
+    if (std.mem.endsWith(u8, url_to_use, "/models")) {
+        return try allocator.dupe(u8, base_url);
+    }
+
+    // Append /models
+    return try std.fmt.allocPrint(allocator, "{s}/models", .{url_to_use});
 }
 
 /// Load models with file-based cache. Cache expires after 12 hours.
@@ -567,7 +631,7 @@ pub fn initFreshConfig(backing_allocator: std.mem.Allocator) !Config {
 // ── Quick setup ──────────────────────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config.
-pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provider: ?[]const u8, memory_backend: ?[]const u8) !void {
+pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provider: ?[]const u8, model: ?[]const u8, memory_backend: ?[]const u8) !void {
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
@@ -580,10 +644,15 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
 
     // Apply overrides
     var provider_overridden = false;
+    var custom_base_url: ?[]const u8 = null;
     if (provider) |p| {
         const info = resolveProviderForQuickSetup(p) orelse return error.UnknownProvider;
         cfg.default_provider = try cfg.allocator.dupe(u8, info.key);
         provider_overridden = true;
+        // Extract base_url for custom provider
+        if (std.mem.startsWith(u8, info.key, "custom:")) {
+            custom_base_url = info.key["custom:".len..];
+        }
     }
     if (api_key) |key| {
         // Store in providers section for the default provider (arena frees old values)
@@ -591,6 +660,7 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
         entries[0] = .{
             .name = try cfg.allocator.dupe(u8, cfg.default_provider),
             .api_key = try cfg.allocator.dupe(u8, key),
+            .base_url = custom_base_url,
         };
         cfg.providers = entries;
     }
@@ -602,7 +672,10 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     }
 
     // Set default model based on provider
-    if (provider_overridden) {
+    if (model) |m| {
+        // Use the explicitly provided model
+        cfg.default_model = try cfg.allocator.dupe(u8, m);
+    } else if (provider_overridden) {
         cfg.default_model = defaultModelForProvider(cfg.default_provider);
     } else if (cfg.default_model == null or std.mem.eql(u8, cfg.default_model.?, "anthropic/claude-sonnet-4")) {
         cfg.default_model = defaultModelForProvider(cfg.default_provider);
@@ -1353,18 +1426,51 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     for (known_providers, 0..) |p, i| {
         try out.print("    [{d}] {s}\n", .{ i + 1, p.label });
     }
+    try out.print("    [{d}] Custom OpenAI-compatible provider (custom:https://.../v1)\n", .{known_providers.len + 1});
     try out.writeAll("  Choice [1]: ");
-    const provider_idx = promptChoice(out, &input_buf, known_providers.len, 0) orelse {
+    const provider_idx = promptChoice(out, &input_buf, known_providers.len + 1, 0) orelse {
         try out.writeAll("\n  Aborted.\n");
         try out.flush();
         return;
     };
-    const selected_provider = known_providers[provider_idx];
-    cfg.default_provider = selected_provider.key;
-    try out.print("  -> {s}\n\n", .{selected_provider.label});
+
+    if (provider_idx < known_providers.len) {
+        const provider = known_providers[provider_idx];
+        cfg.default_provider = provider.key;
+        try out.print("  -> {s}\n\n", .{provider.label});
+    } else {
+        // Custom provider - prompt for URL
+        var custom_url_buf: [512]u8 = undefined;
+        try out.writeAll("\n  Custom provider configuration:\n");
+        try out.writeAll("  Enter OpenAI-compatible endpoint URL (e.g., https://api.example.com/v1): ");
+        const custom_url = prompt(out, &custom_url_buf, "", "") orelse {
+            try out.writeAll("\n  Aborted.\n");
+            try out.flush();
+            return;
+        };
+        if (custom_url.len == 0) {
+            try out.writeAll("\n  Error: Custom provider URL cannot be empty\n");
+            try out.flush();
+            return;
+        }
+        if (!isValidCustomProviderUrl(custom_url)) {
+            try out.writeAll("\n  Error: endpoint must be http(s) and include a version segment like /v1\n");
+            try out.flush();
+            return;
+        }
+        const custom_provider_key = try std.fmt.allocPrint(cfg.allocator, "custom:{s}", .{custom_url});
+        cfg.default_provider = custom_provider_key;
+
+        // Add to providers section with base_url
+        const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
+        entries[0] = .{ .name = try cfg.allocator.dupe(u8, cfg.default_provider), .base_url = try cfg.allocator.dupe(u8, custom_url) };
+        cfg.providers = entries;
+
+        try out.print("  -> Custom: {s}\n\n", .{custom_url});
+    }
 
     // ── Step 2: API key ──
-    const env_hint = selected_provider.env_var;
+    const env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
     try out.print("  Step 2/8: Enter API key (or press Enter to use env var {s}): ", .{env_hint});
     const api_key_input = prompt(out, &input_buf, "", "") orelse {
         try out.writeAll("\n  Aborted.\n");
@@ -1372,9 +1478,17 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         return;
     };
     if (api_key_input.len > 0) {
-        // Store in providers section (arena frees old values)
+        // Store in providers section (preserve base_url if already set for custom provider)
         const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-        entries[0] = .{ .name = try cfg.allocator.dupe(u8, cfg.default_provider), .api_key = try cfg.allocator.dupe(u8, api_key_input) };
+        var base_url: ?[]const u8 = null;
+        if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
+            base_url = cfg.providers[0].base_url;
+        }
+        entries[0] = .{
+            .name = try cfg.allocator.dupe(u8, cfg.default_provider),
+            .api_key = try cfg.allocator.dupe(u8, api_key_input),
+            .base_url = base_url,
+        };
         cfg.providers = entries;
         try out.writeAll("  -> API key set\n\n");
     } else {
@@ -1382,31 +1496,64 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     }
 
     // ── Step 3: Model (with live fetching) ──
+    const default_model_for_provider = if (provider_idx < known_providers.len)
+        known_providers[provider_idx].default_model
+    else
+        "gpt-5.2";
+
     try out.writeAll("  Step 3/8: Select a model\n");
     try out.writeAll("  Fetching available models...\n");
     try out.flush();
 
-    const live_models = fetchModels(allocator, selected_provider.key, cfg.defaultProviderKey()) catch
-        try dupeFallbackModels(allocator, selected_provider.key);
-    defer {
-        for (live_models) |m| allocator.free(m);
-        allocator.free(live_models);
+    // Try to fetch models for both known and custom providers
+    var models_fetched = false;
+    var live_models: []const []const u8 = undefined;
+    var models_to_use: []const []const u8 = undefined;
+
+    const provider_for_fetch = if (std.mem.startsWith(u8, cfg.default_provider, "custom:"))
+        cfg.default_provider["custom:".len..]
+    else
+        cfg.default_provider;
+
+    if (fetchModels(allocator, provider_for_fetch, cfg.defaultProviderKey())) |models| {
+        models_fetched = true;
+        live_models = models;
+        models_to_use = live_models;
+    } else |_| {
+        try out.writeAll("  Could not fetch models (will use fallback)\n");
+        try out.flush();
+        models_to_use = try dupeFallbackModels(allocator, provider_for_fetch);
     }
 
-    // Show up to 15 models as numbered choices
-    const display_max: usize = @min(live_models.len, 15);
-    for (live_models[0..display_max], 0..) |m, i| {
-        const is_default = std.mem.eql(u8, m, selected_provider.default_model);
-        if (is_default) {
-            try out.print("    [{d}] {s} (default)\n", .{ i + 1, m });
+    defer {
+        if (models_fetched) {
+            for (live_models) |m| allocator.free(m);
+            allocator.free(live_models);
         } else {
-            try out.print("    [{d}] {s}\n", .{ i + 1, m });
+            for (models_to_use) |m| allocator.free(m);
+            allocator.free(models_to_use);
         }
     }
-    if (live_models.len > display_max) {
-        try out.print("    ... and {d} more (type name to use any model)\n", .{live_models.len - display_max});
+
+    // Show up to 15 models as numbered choices if we successfully fetched them
+    if (models_fetched) {
+        const display_max: usize = @min(models_to_use.len, 15);
+        for (models_to_use[0..display_max], 0..) |m, i| {
+            const is_default = std.mem.eql(u8, m, default_model_for_provider);
+            if (is_default) {
+                try out.print("    [{d}] {s} (default)\n", .{ i + 1, m });
+            } else {
+                try out.print("    [{d}] {s}\n", .{ i + 1, m });
+            }
+        }
+        if (models_to_use.len > display_max) {
+            try out.print("    ... and {d} more (type name to use any model)\n", .{models_to_use.len - display_max});
+        }
+        try out.print("  Choice [1] or model name [{s}]: ", .{default_model_for_provider});
+    } else {
+        try out.writeAll("  Enter model name directly:\n");
+        try out.print("  Model name [{s}]: ", .{default_model_for_provider});
     }
-    try out.print("  Choice [1] or model name [{s}]: ", .{selected_provider.default_model});
     const model_input = prompt(out, &input_buf, "", "") orelse {
         try out.writeAll("\n  Aborted.\n");
         try out.flush();
@@ -1414,21 +1561,28 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     };
     if (model_input.len == 0) {
         // Default: use first model from the list (or provider default)
-        // Must dupe because live_models will be freed in defer block
-        cfg.default_model = if (live_models.len > 0)
-            try cfg.allocator.dupe(u8, live_models[0])
+        // Must dupe because models_to_use will be freed in defer block
+        cfg.default_model = if (models_to_use.len > 0)
+            try cfg.allocator.dupe(u8, models_to_use[0])
         else
-            try cfg.allocator.dupe(u8, selected_provider.default_model);
-    } else if (std.fmt.parseInt(usize, model_input, 10)) |num| {
-        if (num >= 1 and num <= display_max) {
-            // Must dupe because live_models will be freed in defer block
-            cfg.default_model = try cfg.allocator.dupe(u8, live_models[num - 1]);
-        } else {
-            // Must dupe because selected_provider.default_model is from const static data
-            cfg.default_model = try cfg.allocator.dupe(u8, selected_provider.default_model);
+            try cfg.allocator.dupe(u8, default_model_for_provider);
+    } else if (models_fetched) {
+        // If we successfully fetched models, try to parse as number (menu selection) or use as free-form model name
+        const display_max: usize = @min(models_to_use.len, 15);
+        if (std.fmt.parseInt(usize, model_input, 10)) |num| {
+            if (num >= 1 and num <= display_max) {
+                // Must dupe because models_to_use will be freed in defer block
+                cfg.default_model = try cfg.allocator.dupe(u8, models_to_use[num - 1]);
+            } else {
+                // Must dupe because default_model_for_provider is from const static data
+                cfg.default_model = try cfg.allocator.dupe(u8, default_model_for_provider);
+            }
+        } else |_| {
+            // Free-form model name typed by user
+            cfg.default_model = try cfg.allocator.dupe(u8, model_input);
         }
-    } else |_| {
-        // Free-form model name typed by user
+    } else {
+        // If we couldn't fetch models, use input as model name directly
         cfg.default_model = try cfg.allocator.dupe(u8, model_input);
     }
     try out.print("  -> {s}\n\n", .{cfg.default_model.?});
@@ -1558,7 +1712,9 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     try out.print("  [OK] Config:     {s}\n", .{cfg.config_path});
     try out.writeAll("\n  Next steps:\n");
     if (cfg.defaultProviderKey() == null) {
-        try out.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{env_hint});
+        // Recalculate env_hint for the final display
+        const final_env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
+        try out.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{final_env_hint});
         try out.writeAll("    2. Chat:              nullclaw agent -m \"Hello!\"\n");
         try out.writeAll("    3. Gateway:           nullclaw gateway\n");
     } else {
@@ -2669,6 +2825,25 @@ test "resolveProviderForQuickSetup handles known and alias names" {
 
 test "resolveProviderForQuickSetup rejects unknown provider" {
     try std.testing.expect(resolveProviderForQuickSetup("totally-unknown-provider") == null);
+}
+
+test "resolveProviderForQuickSetup supports custom: prefix" {
+    const custom = resolveProviderForQuickSetup("custom:https://example.com/v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://example.com/v1", custom.key);
+    try std.testing.expectEqualStrings("Custom OpenAI-compatible provider", custom.label);
+    try std.testing.expectEqualStrings("gpt-5.2", custom.default_model);
+    try std.testing.expectEqualStrings("API_KEY", custom.env_var);
+}
+
+test "resolveProviderForQuickSetup supports custom: versioned endpoint beyond v1" {
+    const custom = resolveProviderForQuickSetup("custom:https://example.com/openai/v2") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://example.com/openai/v2", custom.key);
+}
+
+test "resolveProviderForQuickSetup rejects invalid custom endpoint format" {
+    try std.testing.expect(resolveProviderForQuickSetup("custom:") == null);
+    try std.testing.expect(resolveProviderForQuickSetup("custom:https://example.com/api") == null);
+    try std.testing.expect(resolveProviderForQuickSetup("custom:example.com/v1") == null);
 }
 
 test "resolveMemoryBackendForQuickSetup validates enabled, disabled and unknown backends" {

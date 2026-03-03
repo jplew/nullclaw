@@ -418,6 +418,60 @@ pub fn curlGet(allocator: Allocator, url: []const u8, headers: []const []const u
     return curlGetWithProxy(allocator, url, headers, timeout_secs, null);
 }
 
+/// Read proxy URL from standard environment variables.
+/// Checks HTTPS_PROXY, HTTP_PROXY, ALL_PROXY in that order.
+/// Returns null if no proxy is set.
+/// Caller owns returned memory.
+var proxy_override_value: ?[]u8 = null;
+var proxy_override_mutex: std.Thread.Mutex = .{};
+
+pub const ProxyOverrideError = error{OutOfMemory};
+
+/// Set process-wide proxy override from config.
+/// When set, this value has higher priority than proxy environment variables.
+pub fn setProxyOverride(proxy: ?[]const u8) ProxyOverrideError!void {
+    proxy_override_mutex.lock();
+    defer proxy_override_mutex.unlock();
+
+    if (proxy_override_value) |existing| {
+        std.heap.page_allocator.free(existing);
+        proxy_override_value = null;
+    }
+
+    if (proxy) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return;
+        proxy_override_value = try std.heap.page_allocator.dupe(u8, trimmed);
+    }
+}
+
+fn normalizeProxyEnvValue(allocator: Allocator, val: []const u8) !?[]const u8 {
+    const trimmed = std.mem.trim(u8, val, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return try allocator.dupe(u8, trimmed);
+}
+
+pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
+    {
+        proxy_override_mutex.lock();
+        defer proxy_override_mutex.unlock();
+        if (proxy_override_value) |override| {
+            return try allocator.dupe(u8, override);
+        }
+    }
+
+    const env_vars = [_][]const u8{ "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY" };
+    for (env_vars) |var_name| {
+        if (std.process.getEnvVarOwned(allocator, var_name)) |val| {
+            errdefer allocator.free(val);
+            const out = try normalizeProxyEnvValue(allocator, val);
+            allocator.free(val);
+            if (out) |proxy| return proxy;
+        } else |_| {}
+    }
+    return null;
+}
+
 /// HTTP GET via curl for SSE (Server-Sent Events).
 ///
 /// Uses -N (--no-buffer) to disable output buffering, allowing
@@ -527,4 +581,53 @@ test "curlGet with zero headers compiles and is callable" {
 
 test "curlGetWithResolve compiles and is callable" {
     try std.testing.expect(true);
+}
+
+test "normalizeProxyEnvValue trims surrounding whitespace" {
+    const alloc = std.testing.allocator;
+    const normalized = try normalizeProxyEnvValue(alloc, "  socks5://127.0.0.1:1080 \r\n");
+    defer if (normalized) |v| alloc.free(v);
+    try std.testing.expect(normalized != null);
+    try std.testing.expectEqualStrings("socks5://127.0.0.1:1080", normalized.?);
+}
+
+test "normalizeProxyEnvValue rejects empty values" {
+    const normalized = try normalizeProxyEnvValue(std.testing.allocator, " \t\r\n");
+    try std.testing.expect(normalized == null);
+}
+
+test "setProxyOverride applies and clears process-wide override" {
+    const override = "  socks5://proxy-override-test.invalid:1080  ";
+    const normalized_override = "socks5://proxy-override-test.invalid:1080";
+
+    try setProxyOverride(override);
+    const from_override = try getProxyFromEnv(std.testing.allocator);
+    defer if (from_override) |v| std.testing.allocator.free(v);
+    try std.testing.expect(from_override != null);
+    try std.testing.expectEqualStrings(normalized_override, from_override.?);
+
+    try setProxyOverride(null);
+    const after_clear = try getProxyFromEnv(std.testing.allocator);
+    defer if (after_clear) |v| std.testing.allocator.free(v);
+    if (after_clear) |proxy| {
+        // Environment may define a proxy; only assert our override no longer leaks.
+        try std.testing.expect(!std.mem.eql(u8, proxy, normalized_override));
+    }
+}
+
+test "setProxyOverride accepts long proxy URLs" {
+    const allocator = std.testing.allocator;
+    var long_proxy = try allocator.alloc(u8, 1600);
+    defer allocator.free(long_proxy);
+
+    @memcpy(long_proxy[0.."http://".len], "http://");
+    @memset(long_proxy["http://".len..], 'a');
+
+    try setProxyOverride(long_proxy);
+    defer setProxyOverride(null) catch unreachable;
+
+    const from_override = try getProxyFromEnv(allocator);
+    defer if (from_override) |v| allocator.free(v);
+    try std.testing.expect(from_override != null);
+    try std.testing.expectEqual(long_proxy.len, from_override.?.len);
 }

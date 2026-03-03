@@ -21,6 +21,36 @@ pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]co
 }
 
 fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
+    // Handle custom: prefix specially (e.g., "custom:https://example.com/v2/model")
+    if (std.mem.startsWith(u8, primary, "custom:")) {
+        // The format is "custom:<provider_url>/<model>" where <provider_url> may contain slashes.
+        // To preserve model IDs that may also contain '/', split after a versioned API segment:
+        // "/v1/", "/v2/", etc.
+        const proto_start = std.mem.indexOf(u8, primary, "://") orelse return null;
+        var i: usize = proto_start + 3;
+        var model_start: ?usize = null;
+        while (i + 3 < primary.len) : (i += 1) {
+            if (primary[i] != '/' or primary[i + 1] != 'v') continue;
+            var j = i + 2;
+            var has_digit = false;
+            while (j < primary.len and std.ascii.isDigit(primary[j])) : (j += 1) {
+                has_digit = true;
+            }
+            if (!has_digit) continue;
+            if (j < primary.len and primary[j] == '/') {
+                if (j + 1 >= primary.len) return null;
+                model_start = j + 1;
+                break;
+            }
+        }
+        const split_at = model_start orelse return null;
+        return .{
+            .provider = primary[0 .. split_at - 1],
+            .model = primary[split_at..],
+        };
+    }
+
+    // Regular provider/model format (e.g., "openrouter/anthropic/claude-sonnet-4")
     const slash = std.mem.indexOfScalar(u8, primary, '/') orelse return null;
     if (slash == 0 or slash + 1 >= primary.len) return null;
     return .{
@@ -296,7 +326,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
     if (root.get("default_provider")) |v| {
-        if (v == .string) self.legacy_default_provider_detected = true;
+        if (v == .string) {
+            self.default_provider = try self.allocator.dupe(u8, v.string);
+            self.legacy_default_provider_detected = true;
+        }
     }
     // Legacy key is no longer accepted. Require agents.defaults.model.primary.
     if (root.get("default_model")) |_| {
@@ -358,10 +391,19 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         if (mdl == .object) {
                             if (mdl.object.get("primary")) |v| {
                                 if (v == .string) {
+                                    // Always try to parse primary field - it may contain full provider/model info
+                                    // or just the model part (when legacy default_provider exists)
                                     if (splitPrimaryModelRef(v.string)) |parsed_ref| {
-                                        self.default_provider = try self.allocator.dupe(u8, parsed_ref.provider);
                                         self.default_model = try self.allocator.dupe(u8, parsed_ref.model);
-                                    } else {
+                                        // Only update provider if not already set from legacy field
+                                        if (!self.legacy_default_provider_detected) {
+                                            self.default_provider = try self.allocator.dupe(u8, parsed_ref.provider);
+                                        }
+                                    } else if (self.legacy_default_provider_detected) {
+                                        // Legacy top-level default_provider + model-only primary.
+                                        self.default_model = try self.allocator.dupe(u8, v.string);
+                                    } else if (!self.legacy_default_provider_detected) {
+                                        // Only fail if neither legacy nor new format provides valid data
                                         self.default_provider = "";
                                         self.default_model = null;
                                     }
@@ -523,6 +565,29 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (diag.object.get("log_llm_io")) |v| {
                 if (v == .bool) self.diagnostics.log_llm_io = v.bool;
+            }
+            if (diag.object.get("api_error_max_chars")) |v| {
+                if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
+                    self.diagnostics.api_error_max_chars = @intCast(v.integer);
+                }
+            }
+            if (diag.object.get("token_usage_ledger_enabled")) |v| {
+                if (v == .bool) self.diagnostics.token_usage_ledger_enabled = v.bool;
+            }
+            if (diag.object.get("token_usage_ledger_window_hours")) |v| {
+                if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
+                    self.diagnostics.token_usage_ledger_window_hours = @intCast(v.integer);
+                }
+            }
+            if (diag.object.get("token_usage_ledger_max_bytes")) |v| {
+                if (v == .integer and v.integer >= 0) {
+                    self.diagnostics.token_usage_ledger_max_bytes = @intCast(v.integer);
+                }
+            }
+            if (diag.object.get("token_usage_ledger_max_lines")) |v| {
+                if (v == .integer and v.integer >= 0) {
+                    self.diagnostics.token_usage_ledger_max_lines = @intCast(v.integer);
+                }
             }
             if (diag.object.get("otel")) |otel| {
                 if (otel == .object) {
@@ -1425,6 +1490,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (hr.object.get("allowed_domains")) |v| {
                 if (v == .array) self.http_request.allowed_domains = try parseStringArray(self.allocator, v.array);
+            }
+            if (hr.object.get("proxy")) |v| {
+                if (v == .string) self.http_request.proxy = try self.allocator.dupe(u8, v.string);
             }
             if (hr.object.get("search_base_url")) |v| {
                 if (v == .string) self.http_request.search_base_url = try self.allocator.dupe(u8, v.string);

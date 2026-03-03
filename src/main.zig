@@ -65,11 +65,19 @@ fn parseCommand(arg: []const u8) ?Command {
     return command_map.get(arg);
 }
 
-pub fn main() !void {
-    // Enable UTF-8 output on Windows console (fixes Cyrillic/Unicode garbling)
+extern "kernel32" fn SetConsoleCP(wCodePageID: std.os.windows.UINT) callconv(.winapi) std.os.windows.BOOL;
+
+fn configureWindowsConsoleUtf8() void {
     if (comptime builtin.os.tag == .windows) {
+        // Set both output and input code pages to UTF-8 so interactive
+        // terminal sessions preserve non-ASCII user input.
         _ = std.os.windows.kernel32.SetConsoleOutputCP(65001);
+        _ = SetConsoleCP(65001);
     }
+}
+
+pub fn main() !void {
+    configureWindowsConsoleUtf8();
 
     const allocator = std.heap.smp_allocator;
 
@@ -88,6 +96,10 @@ pub fn main() !void {
     }
     if (std.mem.eql(u8, args[1], "--list-models")) {
         try yc.list_models.run(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "--probe-provider-health")) {
+        try yc.provider_probe.run(allocator, args[2..]);
         return;
     }
     if (std.mem.eql(u8, args[1], "--from-json")) {
@@ -135,6 +147,17 @@ fn printVersion() void {
 
 const GatewayDaemonOverrideError = error{InvalidPort};
 
+fn applyRuntimeProviderOverrides(config: *const yc.config.Config) void {
+    yc.http_util.setProxyOverride(config.http_request.proxy) catch |err| {
+        std.debug.print("Invalid http_request.proxy override: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    yc.providers.setApiErrorLimitOverride(config.diagnostics.api_error_max_chars) catch |err| {
+        std.debug.print("Invalid diagnostics.api_error_max_chars override: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+}
+
 fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const u8) GatewayDaemonOverrideError!void {
     var port: u16 = cfg.gateway.port;
     var host: []const u8 = cfg.gateway.host;
@@ -172,6 +195,7 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         yc.config.Config.printValidationError(err);
         std.process.exit(1);
     };
+    applyRuntimeProviderOverrides(&cfg);
 
     try yc.daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
 }
@@ -1112,6 +1136,7 @@ const OnboardArgs = struct {
     mode: OnboardMode = .quick,
     api_key: ?[]const u8 = null,
     provider: ?[]const u8 = null,
+    model: ?[]const u8 = null,
     memory_backend: ?[]const u8 = null,
 };
 
@@ -1151,6 +1176,12 @@ fn parseOnboardArgs(sub_args: []const []const u8) OnboardArgParseResult {
             parsed.provider = sub_args[i];
             continue;
         }
+        if (std.mem.eql(u8, arg, "--model")) {
+            if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.model = sub_args[i];
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--memory")) {
             if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
             i += 1;
@@ -1175,7 +1206,7 @@ fn parseOnboardArgs(sub_args: []const []const u8) OnboardArgParseResult {
 
 fn printOnboardUsage() void {
     std.debug.print(
-        \\Usage: nullclaw onboard [--interactive | --channels-only | [--api-key KEY] [--provider PROV] [--memory MEM]]
+        \\Usage: nullclaw onboard [--interactive | --channels-only | [--api-key KEY] [--provider PROV] [--model MODEL] [--memory MEM]]
         \\
         \\Modes:
         \\  (default)         quick setup
@@ -1184,11 +1215,13 @@ fn printOnboardUsage() void {
         \\
         \\Quick setup options:
         \\  --api-key KEY     provider API key to persist in config
-        \\  --provider PROV   default provider key (e.g. openrouter, anthropic)
+        \\  --provider PROV   default provider key (e.g. openrouter, anthropic, custom:https://...)
+        \\  --model MODEL     default model for the provider (e.g. gpt-5.2, claude-opus-4-6)
         \\  --memory MEM      memory backend key (e.g. markdown, sqlite, memory)
         \\
         \\Examples:
         \\  nullclaw onboard --api-key sk-... --provider openrouter
+        \\  nullclaw onboard --api-key sk-... --provider custom:https://api.example.com/v1 --model minimaxai/minimax-m2.1
         \\  nullclaw onboard --interactive
         \\
     , .{});
@@ -1247,7 +1280,7 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     switch (parsed.mode) {
         .channels_only => try yc.onboard.runChannelsOnly(allocator),
         .interactive => try yc.onboard.runWizard(allocator),
-        .quick => yc.onboard.runQuickSetup(allocator, parsed.api_key, parsed.provider, parsed.memory_backend) catch |err| switch (err) {
+        .quick => yc.onboard.runQuickSetup(allocator, parsed.api_key, parsed.provider, parsed.model, parsed.memory_backend) catch |err| switch (err) {
             error.UnknownProvider => {
                 const requested = parsed.provider orelse "(missing)";
                 std.debug.print("Unknown provider '{s}' for quick setup.\n", .{requested});
@@ -1406,6 +1439,7 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         yc.config.Config.printValidationError(err);
         std.process.exit(1);
     };
+    applyRuntimeProviderOverrides(&config);
 
     if (!hasConfiguredStartableChannels(&config)) {
         if (hasConfiguredButBuildDisabledStartableChannels(&config)) {
@@ -1656,6 +1690,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     defer if (audit_logger_opt) |*logger| logger.deinit();
 
     var subagent_manager = yc.subagent.SubagentManager.init(allocator, config, null, .{});
+    subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
     defer subagent_manager.deinit();
 
     // Create tools (for system prompt and tool calling)
@@ -1980,6 +2015,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     defer if (audit_logger_opt) |*logger| logger.deinit();
 
     var subagent_manager = yc.subagent.SubagentManager.init(allocator, &config, null, .{});
+    subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
     defer subagent_manager.deinit();
 
     // Create tools (for system prompt and tool calling)
@@ -2524,7 +2560,7 @@ fn printUsage() void {
         \\  help        Show this help
         \\
         \\OPTIONS:
-        \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--memory MEM]
+        \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--model MODEL] [--memory MEM]
         \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
         \\  gateway [--port PORT] [--host HOST]
         \\  version | --version | -V
@@ -2561,6 +2597,11 @@ test "parse known commands" {
     try std.testing.expectEqual(.update, parseCommand("update").?);
     try std.testing.expect(parseCommand("daemon") == null);
     try std.testing.expect(parseCommand("unknown") == null);
+}
+
+test "configureWindowsConsoleUtf8 is safe to call" {
+    configureWindowsConsoleUtf8();
+    try std.testing.expect(true);
 }
 
 test "parsePositiveUsize accepts only positive integers" {

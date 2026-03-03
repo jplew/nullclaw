@@ -274,8 +274,8 @@ pub const OpenAiCompatibleProvider = struct {
         const resp_body = if (auth) |a| blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
-            break :blk root.curlPost(allocator, url, body, &.{auth_hdr}) catch return error.CompatibleApiError;
-        } else root.curlPost(allocator, url, body, &.{}) catch return error.CompatibleApiError;
+            break :blk root.curlPostTimed(allocator, url, body, &.{auth_hdr}, 0) catch return error.CompatibleApiError;
+        } else root.curlPostTimed(allocator, url, body, &.{}, 0) catch return error.CompatibleApiError;
         defer allocator.free(resp_body);
 
         return extractResponsesText(allocator, resp_body);
@@ -559,7 +559,7 @@ pub const OpenAiCompatibleProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPost(allocator, url, body, headers_buf[0..header_count]) catch return error.CompatibleApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], 0) catch return error.CompatibleApiError;
         defer allocator.free(resp_body);
 
         return parseTextResponse(allocator, resp_body) catch |err| {

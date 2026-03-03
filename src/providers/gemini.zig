@@ -3,6 +3,7 @@ const platform = @import("../platform.zig");
 const root = @import("root.zig");
 const error_classify = @import("error_classify.zig");
 const config_types = @import("../config_types.zig");
+const http_util = @import("../http_util.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -658,6 +659,17 @@ pub const GeminiProvider = struct {
         argv_buf[argc] = "Content-Type: application/json";
         argc += 1;
 
+        // Add proxy from environment if set
+        const proxy = http_util.getProxyFromEnv(allocator) catch null;
+        defer if (proxy) |p| allocator.free(p);
+
+        if (proxy) |p| {
+            argv_buf[argc] = "--proxy";
+            argc += 1;
+            argv_buf[argc] = p;
+            argc += 1;
+        }
+
         for (headers) |hdr| {
             argv_buf[argc] = "-H";
             argc += 1;
@@ -795,11 +807,11 @@ pub const GeminiProvider = struct {
         defer allocator.free(body);
 
         const resp_body = if (auth.isApiKey())
-            root.curlPost(allocator, url, body, &.{}) catch return error.GeminiApiError
+            root.curlPostTimed(allocator, url, body, &.{}, 0) catch return error.GeminiApiError
         else blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{auth.credential()}) catch return error.GeminiApiError;
-            break :blk root.curlPost(allocator, url, body, &.{auth_hdr}) catch return error.GeminiApiError;
+            break :blk root.curlPostTimed(allocator, url, body, &.{auth_hdr}, 0) catch return error.GeminiApiError;
         };
         defer allocator.free(resp_body);
 

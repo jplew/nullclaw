@@ -9,6 +9,7 @@ const root = @import("root.zig");
 const sse = @import("sse.zig");
 const platform = @import("../platform.zig");
 const auth = @import("../auth.zig");
+const http_util = @import("../http_util.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -390,6 +391,17 @@ fn codexStreamRequest(
     argc += 1;
     argv_buf[argc] = auth_header;
     argc += 1;
+
+    // Add proxy from environment if set
+    const proxy = http_util.getProxyFromEnv(allocator) catch null;
+    defer if (proxy) |p| allocator.free(p);
+
+    if (proxy) |p| {
+        argv_buf[argc] = "--proxy";
+        argc += 1;
+        argv_buf[argc] = p;
+        argc += 1;
+    }
 
     for (extra_headers) |hdr| {
         argv_buf[argc] = "-H";

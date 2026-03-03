@@ -222,9 +222,14 @@ pub const Config = struct {
         }
         const allocator = arena_ptr.allocator();
 
-        const home = platform.getHomeDir(allocator) catch return error.NoHomeDir;
-
-        const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+        // NULLCLAW_HOME overrides the default config directory (~/.nullclaw/).
+        const config_dir = std.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => blk: {
+                const home = platform.getHomeDir(allocator) catch return error.NoHomeDir;
+                break :blk try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+            },
+            else => return err,
+        };
         const config_path = try std.fs.path.join(allocator, &.{ config_dir, "config.json" });
         const default_workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
 
@@ -680,6 +685,13 @@ pub const Config = struct {
         try w.print(",\n    \"log_message_receipts\": {s}", .{if (self.diagnostics.log_message_receipts) "true" else "false"});
         try w.print(",\n    \"log_message_payloads\": {s}", .{if (self.diagnostics.log_message_payloads) "true" else "false"});
         try w.print(",\n    \"log_llm_io\": {s}", .{if (self.diagnostics.log_llm_io) "true" else "false"});
+        if (self.diagnostics.api_error_max_chars) |n| {
+            try w.print(",\n    \"api_error_max_chars\": {d}", .{n});
+        }
+        try w.print(",\n    \"token_usage_ledger_enabled\": {s}", .{if (self.diagnostics.token_usage_ledger_enabled) "true" else "false"});
+        try w.print(",\n    \"token_usage_ledger_window_hours\": {d}", .{self.diagnostics.token_usage_ledger_window_hours});
+        try w.print(",\n    \"token_usage_ledger_max_bytes\": {d}", .{self.diagnostics.token_usage_ledger_max_bytes});
+        try w.print(",\n    \"token_usage_ledger_max_lines\": {d}", .{self.diagnostics.token_usage_ledger_max_lines});
         if (self.diagnostics.otel_endpoint != null or self.diagnostics.otel_service_name != null) {
             try w.print(",\n    \"otel\": {{", .{});
             var otel_first = true;
@@ -746,6 +758,7 @@ pub const Config = struct {
             .max_response_size = self.http_request.max_response_size,
             .timeout_secs = self.http_request.timeout_secs,
             .allowed_domains = self.http_request.allowed_domains,
+            .proxy = self.http_request.proxy,
             .search_base_url = self.http_request.search_base_url,
             .search_provider = self.http_request.search_provider,
             .search_fallback_providers = self.http_request.search_fallback_providers,
@@ -821,6 +834,8 @@ pub const Config = struct {
         InvalidPort,
         InvalidRetryCount,
         InvalidBackoffMs,
+        InvalidHttpProxyUrl,
+        InvalidApiErrorMaxChars,
         InvalidHttpSearchBaseUrl,
         InvalidHttpSearchProvider,
         InvalidHttpSearchFallbackProvider,
@@ -862,6 +877,16 @@ pub const Config = struct {
         }
         if (self.reliability.provider_backoff_ms > 600_000) {
             return ValidationError.InvalidBackoffMs;
+        }
+        if (self.http_request.proxy) |proxy_url| {
+            if (!config_types.HttpRequestConfig.isValidProxyUrl(proxy_url)) {
+                return ValidationError.InvalidHttpProxyUrl;
+            }
+        }
+        if (self.diagnostics.api_error_max_chars) |n| {
+            if (n < 200 or n > 10_000) {
+                return ValidationError.InvalidApiErrorMaxChars;
+            }
         }
         if (self.http_request.search_base_url) |search_base_url| {
             if (!config_types.HttpRequestConfig.isValidSearchBaseUrl(search_base_url)) {
@@ -950,6 +975,8 @@ pub const Config = struct {
             ValidationError.InvalidPort => std.debug.print("Config error: gateway port must be non-zero.\n", .{}),
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
             ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
+            ValidationError.InvalidHttpProxyUrl => std.debug.print("Config error: http_request.proxy must be a non-empty http://, https://, or socks5:// URL.\n", .{}),
+            ValidationError.InvalidApiErrorMaxChars => std.debug.print("Config error: diagnostics.api_error_max_chars must be in [200, 10000].\n", .{}),
             ValidationError.InvalidHttpSearchBaseUrl => std.debug.print("Config error: http_request.search_base_url must be https://host or https://host/search (no query/fragment).\n", .{}),
             ValidationError.InvalidHttpSearchProvider => std.debug.print("Config error: http_request.search_provider must be one of: auto, searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina.\n", .{}),
             ValidationError.InvalidHttpSearchFallbackProvider => std.debug.print("Config error: http_request.search_fallback_providers entries must be valid providers and cannot be 'auto'.\n", .{}),
@@ -1328,6 +1355,10 @@ test "save roundtrip preserves diagnostics logging flags" {
     cfg.diagnostics.log_message_receipts = true;
     cfg.diagnostics.log_message_payloads = true;
     cfg.diagnostics.log_llm_io = true;
+    cfg.diagnostics.token_usage_ledger_enabled = false;
+    cfg.diagnostics.token_usage_ledger_window_hours = 6;
+    cfg.diagnostics.token_usage_ledger_max_bytes = 131072;
+    cfg.diagnostics.token_usage_ledger_max_lines = 2048;
     try cfg.save();
 
     const file = try std.fs.openFileAbsolute(config_path, .{});
@@ -1348,6 +1379,10 @@ test "save roundtrip preserves diagnostics logging flags" {
     try std.testing.expect(loaded.diagnostics.log_message_receipts);
     try std.testing.expect(loaded.diagnostics.log_message_payloads);
     try std.testing.expect(loaded.diagnostics.log_llm_io);
+    try std.testing.expect(!loaded.diagnostics.token_usage_ledger_enabled);
+    try std.testing.expectEqual(@as(u32, 6), loaded.diagnostics.token_usage_ledger_window_hours);
+    try std.testing.expectEqual(@as(u64, 131072), loaded.diagnostics.token_usage_ledger_max_bytes);
+    try std.testing.expectEqual(@as(u64, 2048), loaded.diagnostics.token_usage_ledger_max_lines);
 }
 
 test "save roundtrip preserves reliability settings" {
@@ -1560,9 +1595,11 @@ test "save roundtrip preserves extended config sections" {
     cfg.http_request.enabled = true;
     cfg.http_request.max_response_size = 12345;
     cfg.http_request.timeout_secs = 8;
+    cfg.http_request.proxy = "socks5://127.0.0.1:1080";
     cfg.http_request.search_base_url = "https://searx.example.com";
     cfg.http_request.search_provider = "brave";
     cfg.http_request.search_fallback_providers = &.{ "jina", "duckduckgo" };
+    cfg.diagnostics.api_error_max_chars = 500;
 
     cfg.identity.format = "aieos";
     cfg.identity.aieos_path = "id.json";
@@ -1646,10 +1683,12 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expect(loaded.browser.enabled);
     try std.testing.expectEqual(@as(usize, 2), loaded.browser.allowed_domains.len);
     try std.testing.expect(loaded.http_request.enabled);
+    try std.testing.expectEqualStrings("socks5://127.0.0.1:1080", loaded.http_request.proxy.?);
     try std.testing.expectEqualStrings("https://searx.example.com", loaded.http_request.search_base_url.?);
     try std.testing.expectEqualStrings("brave", loaded.http_request.search_provider);
     try std.testing.expectEqual(@as(usize, 2), loaded.http_request.search_fallback_providers.len);
     try std.testing.expectEqualStrings("jina", loaded.http_request.search_fallback_providers[0]);
+    try std.testing.expectEqual(@as(?u32, 500), loaded.diagnostics.api_error_max_chars);
     try std.testing.expectEqualStrings("aieos", loaded.identity.format);
     try std.testing.expectEqual(@as(u8, 70), loaded.cost.warn_at_percent);
     try std.testing.expectEqual(config_types.SandboxBackend.firejail, loaded.security.sandbox.backend);
@@ -1898,6 +1937,28 @@ test "validation rejects invalid http_request search fallback provider" {
     };
     cfg.http_request.search_fallback_providers = &.{"auto"};
     try std.testing.expectError(Config.ValidationError.InvalidHttpSearchFallbackProvider, cfg.validate());
+}
+
+test "validation rejects invalid http_request proxy URL" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.http_request.proxy = "ftp://proxy.example.com:21";
+    try std.testing.expectError(Config.ValidationError.InvalidHttpProxyUrl, cfg.validate());
+}
+
+test "validation rejects out-of-range diagnostics api_error_max_chars" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.diagnostics.api_error_max_chars = 120;
+    try std.testing.expectError(Config.ValidationError.InvalidApiErrorMaxChars, cfg.validate());
 }
 
 test "validation rejects malformed web path" {
@@ -2202,7 +2263,7 @@ test "validation rejects relay ttl values outside supported ranges" {
 test "json parse diagnostics section" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"diagnostics": {"backend": "otel", "log_tool_calls": true, "log_message_receipts": true, "log_message_payloads": true, "log_llm_io": true, "otel": {"endpoint": "http://localhost:4318", "service_name": "yc"}}}
+        \\{"diagnostics": {"backend": "otel", "log_tool_calls": true, "log_message_receipts": true, "log_message_payloads": true, "log_llm_io": true, "token_usage_ledger_enabled": false, "token_usage_ledger_window_hours": 12, "token_usage_ledger_max_bytes": 262144, "token_usage_ledger_max_lines": 4096, "otel": {"endpoint": "http://localhost:4318", "service_name": "yc"}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -2211,6 +2272,10 @@ test "json parse diagnostics section" {
     try std.testing.expect(cfg.diagnostics.log_message_receipts);
     try std.testing.expect(cfg.diagnostics.log_message_payloads);
     try std.testing.expect(cfg.diagnostics.log_llm_io);
+    try std.testing.expect(!cfg.diagnostics.token_usage_ledger_enabled);
+    try std.testing.expectEqual(@as(u32, 12), cfg.diagnostics.token_usage_ledger_window_hours);
+    try std.testing.expectEqual(@as(u64, 262144), cfg.diagnostics.token_usage_ledger_max_bytes);
+    try std.testing.expectEqual(@as(u64, 4096), cfg.diagnostics.token_usage_ledger_max_lines);
     try std.testing.expectEqualStrings("http://localhost:4318", cfg.diagnostics.otel_endpoint.?);
     try std.testing.expectEqualStrings("yc", cfg.diagnostics.otel_service_name.?);
     allocator.free(cfg.diagnostics.backend);
@@ -2448,6 +2513,18 @@ test "json parse http_request search provider settings" {
     allocator.free(cfg.http_request.search_fallback_providers);
 }
 
+test "json parse http_request proxy and diagnostics api_error_max_chars" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"http_request": {"proxy": "http://proxy.example.com:8080"}, "diagnostics": {"api_error_max_chars": 640}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("http://proxy.example.com:8080", cfg.http_request.proxy.?);
+    try std.testing.expectEqual(@as(?u32, 640), cfg.diagnostics.api_error_max_chars);
+    allocator.free(cfg.http_request.proxy.?);
+}
+
 test "json parse model routes" {
     const allocator = std.testing.allocator;
     const json =
@@ -2597,6 +2674,33 @@ test "parse agents.defaults.model.primary" {
     try std.testing.expectEqualStrings("claude-opus-4", cfg.default_model.?);
     allocator.free(cfg.default_provider);
     allocator.free(cfg.default_model.?);
+}
+
+test "parse agents.defaults.model.primary custom provider supports versioned path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"agents":{"defaults":{"model":{"primary":"custom:https://api.example.com/openai/v2/minimaxai/minimax-m2.1"}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("custom:https://api.example.com/openai/v2", cfg.default_provider);
+    try std.testing.expectEqualStrings("minimaxai/minimax-m2.1", cfg.default_model.?);
+}
+
+test "parse legacy default_provider with model-only primary preserves model" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"default_provider":"openai","agents":{"defaults":{"model":{"primary":"gpt-5.2"}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.legacy_default_provider_detected);
+    try std.testing.expectEqualStrings("openai", cfg.default_provider);
+    try std.testing.expectEqualStrings("gpt-5.2", cfg.default_model.?);
 }
 
 // verify that workspace override field (with backslashes) does not

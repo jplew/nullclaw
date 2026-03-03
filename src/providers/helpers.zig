@@ -285,14 +285,18 @@ pub fn convertToolsAnthropic(buf: *std.ArrayListUnmanaged(u8), allocator: std.me
 }
 
 /// HTTP POST with optional LLM timeout (seconds). 0 = no limit.
+/// Automatically reads proxy from HTTPS_PROXY, HTTP_PROXY, or ALL_PROXY environment variables.
 pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, headers: []const []const u8, timeout_secs: u64) ![]u8 {
+    const proxy = http_util.getProxyFromEnv(allocator) catch null;
+    defer if (proxy) |p| allocator.free(p);
+
     if (timeout_secs > 0) {
-        var timeout_buf: [16]u8 = undefined;
+        var timeout_buf: [32]u8 = undefined;
         const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch
-            return http_util.curlPost(allocator, url, body, headers);
-        return http_util.curlPostWithProxy(allocator, url, body, headers, null, timeout_str);
+            return http_util.curlPostWithProxy(allocator, url, body, headers, proxy, null);
+        return http_util.curlPostWithProxy(allocator, url, body, headers, proxy, timeout_str);
     }
-    return http_util.curlPost(allocator, url, body, headers);
+    return http_util.curlPostWithProxy(allocator, url, body, headers, proxy, null);
 }
 
 /// Extract text content from a provider JSON response.

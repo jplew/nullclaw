@@ -264,7 +264,7 @@ pub const OpenRouterProvider = struct {
         var title_hdr_buf: [128]u8 = undefined;
         const title_hdr = std.fmt.bufPrint(&title_hdr_buf, "X-Title: {s}", .{TITLE}) catch return error.OpenRouterApiError;
 
-        const resp_body = root.curlPost(allocator, BASE_URL, body, &.{ auth_hdr, referer_hdr, title_hdr }) catch return error.OpenRouterApiError;
+        const resp_body = root.curlPostTimed(allocator, BASE_URL, body, &.{ auth_hdr, referer_hdr, title_hdr }, 0) catch return error.OpenRouterApiError;
         defer allocator.free(resp_body);
 
         return parseTextResponse(allocator, resp_body);
@@ -318,7 +318,7 @@ pub const OpenRouterProvider = struct {
         var title_hdr_buf: [128]u8 = undefined;
         const title_hdr = std.fmt.bufPrint(&title_hdr_buf, "X-Title: {s}", .{TITLE}) catch return error.OpenRouterApiError;
 
-        const resp_body = root.curlPost(allocator, BASE_URL, body, &.{ auth_hdr, referer_hdr, title_hdr }) catch return error.OpenRouterApiError;
+        const resp_body = root.curlPostTimed(allocator, BASE_URL, body, &.{ auth_hdr, referer_hdr, title_hdr }, 0) catch return error.OpenRouterApiError;
         defer allocator.free(resp_body);
 
         return parseTextResponse(allocator, resp_body);

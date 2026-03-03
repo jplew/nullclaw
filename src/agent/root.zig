@@ -210,6 +210,16 @@ pub const Agent = struct {
         }
     };
 
+    pub const UsageRecord = struct {
+        ts: i64,
+        provider: []const u8,
+        model: []const u8,
+        usage: providers.TokenUsage,
+        success: bool,
+    };
+
+    pub const UsageRecordCallback = *const fn (ctx: *anyopaque, record: UsageRecord) void;
+
     allocator: std.mem.Allocator,
     provider: Provider,
     tools: []const Tool,
@@ -285,6 +295,10 @@ pub const Agent = struct {
     stream_callback: ?providers.StreamCallback = null,
     /// Context pointer passed to stream_callback.
     stream_ctx: ?*anyopaque = null,
+    /// Optional callback invoked for each LLM response usage record.
+    usage_record_callback: ?UsageRecordCallback = null,
+    /// Context pointer passed to usage_record_callback.
+    usage_record_ctx: ?*anyopaque = null,
     /// Conversation context for the current turn (Signal-specific for now).
     conversation_context: ?prompt.ConversationContext = null,
 
@@ -803,7 +817,7 @@ pub const Agent = struct {
             const messages = try self.buildProviderMessages(arena);
 
             const timer_start = std.time.milliTimestamp();
-            const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
+            const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
             const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
 
             // Call provider: streaming (no retries, no native tools) or blocking with retry
@@ -836,6 +850,7 @@ pub const Agent = struct {
                         .error_message = @errorName(err),
                     } };
                     self.observer.recordEvent(&fail_event);
+                    self.emitUsageFailure();
                     return err;
                 };
                 response = ChatResponse{
@@ -894,7 +909,10 @@ pub const Agent = struct {
                             },
                             self.model_name,
                             self.temperature,
-                        ) catch return err;
+                        ) catch |retry_after_compact_err| {
+                            self.emitUsageFailure();
+                            return retry_after_compact_err;
+                        };
                     }
 
                     // Retry once
@@ -935,8 +953,12 @@ pub const Agent = struct {
                                 },
                                 self.model_name,
                                 self.temperature,
-                            ) catch return retry_err;
+                            ) catch |retry_after_compact_err| {
+                                self.emitUsageFailure();
+                                return retry_after_compact_err;
+                            };
                         }
+                        self.emitUsageFailure();
                         return retry_err;
                     };
                 };
@@ -956,6 +978,7 @@ pub const Agent = struct {
             // Track tokens
             self.total_tokens += response.usage.total_tokens;
             self.last_turn_usage = response.usage;
+            self.emitUsageRecord(&response, true);
 
             const response_text = response.contentOrEmpty();
             const use_native = response.hasToolCalls();
@@ -1019,8 +1042,16 @@ pub const Agent = struct {
                 assistant_history_content = response_text;
             }
 
-            // Determine display text
-            const display_text = if (parsed_text.len > 0) parsed_text else response_text;
+            // Determine display text.
+            // When tool calls are present, only show parsed plain text (if any).
+            // Never fall back to raw response_text here, otherwise markup like
+            // <tool_call>...</tool_call> can leak to users.
+            const display_text = if (parsed_calls.len > 0)
+                parsed_text
+            else if (parsed_text.len > 0)
+                parsed_text
+            else
+                response_text;
 
             if (parsed_calls.len == 0) {
                 // Guardrail: if the model promises "I'll try/check now" but emits no
@@ -1508,12 +1539,13 @@ pub const Agent = struct {
         const content = response.contentOrEmpty();
         const preview = llmLogPreview(content);
         log.info(
-            "llm response session=0x{x} iter={d} attempt={d} model={s} bytes={d} tool_calls={d} usage={f} content={f}{s}",
+            "llm response session=0x{x} iter={d} attempt={d} provider={s} model={s} bytes={d} tool_calls={d} usage={f} content={f}{s}",
             .{
                 session_hash,
                 iteration,
                 attempt,
-                if (response.model.len > 0) response.model else self.model_name,
+                self.effectiveProvider(response),
+                self.effectiveModel(response),
                 content.len,
                 response.tool_calls.len,
                 std.json.fmt(response.usage, .{}),
@@ -1553,6 +1585,36 @@ pub const Agent = struct {
                 },
             );
         }
+    }
+
+    fn effectiveProvider(self: *const Agent, response: *const ChatResponse) []const u8 {
+        if (response.provider.len > 0) return response.provider;
+        return self.provider.getName();
+    }
+
+    fn effectiveModel(self: *const Agent, response: *const ChatResponse) []const u8 {
+        if (response.model.len > 0) return response.model;
+        return self.model_name;
+    }
+
+    fn emitUsageRecord(self: *Agent, response: *const ChatResponse, success: bool) void {
+        const cb = self.usage_record_callback orelse return;
+        const ctx = self.usage_record_ctx orelse return;
+        cb(ctx, .{
+            .ts = std.time.timestamp(),
+            .provider = self.effectiveProvider(response),
+            .model = self.effectiveModel(response),
+            .usage = response.usage,
+            .success = success,
+        });
+    }
+
+    fn emitUsageFailure(self: *Agent) void {
+        const failed = ChatResponse{
+            .model = self.model_name,
+            .usage = .{},
+        };
+        self.emitUsageRecord(&failed, false);
     }
 
     /// Build provider-ready ChatMessage slice from owned history.
@@ -1635,6 +1697,7 @@ pub const Agent = struct {
             if (tc.arguments.len > 0) self.allocator.free(tc.arguments);
         }
         if (resp.tool_calls.len > 0) self.allocator.free(resp.tool_calls);
+        if (resp.provider.len > 0) self.allocator.free(resp.provider);
         if (resp.model.len > 0) self.allocator.free(resp.model);
         if (resp.reasoning_content) |rc| {
             if (rc.len > 0) self.allocator.free(rc);
@@ -1642,6 +1705,7 @@ pub const Agent = struct {
         // Mark as consumed to prevent double-free
         resp.content = null;
         resp.tool_calls = &.{};
+        resp.provider = "";
         resp.model = "";
         resp.reasoning_content = null;
     }
@@ -4135,6 +4199,105 @@ test "Agent streaming fields can be set" {
 
     try std.testing.expect(agent.stream_callback != null);
     try std.testing.expect(agent.stream_ctx != null);
+}
+
+test "Agent falls back to blocking chat when stream ctx is missing" {
+    const allocator = std.testing.allocator;
+
+    const StreamGuardProvider = struct {
+        chat_calls: usize = 0,
+        stream_calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "ok");
+        }
+
+        fn chat(ptr: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.chat_calls += 1;
+            return .{
+                .content = try allocator_.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            _: providers.StreamCallback,
+            _: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.stream_calls += 1;
+            return error.ShouldNotStream;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "stream-guard";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state = StreamGuardProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = StreamGuardProvider.chatWithSystem,
+        .chat = StreamGuardProvider.chat,
+        .supportsNativeTools = StreamGuardProvider.supportsNativeTools,
+        .getName = StreamGuardProvider.getName,
+        .deinit = StreamGuardProvider.deinitFn,
+        .supports_streaming = StreamGuardProvider.supportsStreaming,
+        .stream_chat = StreamGuardProvider.streamChat,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const test_cb: providers.StreamCallback = struct {
+        fn cb(_: *anyopaque, _: providers.StreamChunk) void {}
+    }.cb;
+    agent.stream_callback = test_cb;
+    agent.stream_ctx = null;
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.stream_calls);
 }
 
 test "Agent shouldForceActionFollowThrough detects english deferred promise" {

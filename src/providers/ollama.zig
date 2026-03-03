@@ -286,7 +286,7 @@ pub const OllamaProvider = struct {
         const body = try buildRequestBody(allocator, system_prompt, message, model, temperature);
         defer allocator.free(body);
 
-        const resp_body = root.curlPost(allocator, url, body, &.{}) catch return error.OllamaApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, &.{}, 0) catch return error.OllamaApiError;
         defer allocator.free(resp_body);
 
         return parseResponse(allocator, resp_body);

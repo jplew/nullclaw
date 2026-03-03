@@ -17,9 +17,11 @@ const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
 const session_mod = @import("session.zig");
 const providers = @import("providers/root.zig");
+const http_util = @import("http_util.zig");
 const tools_mod = @import("tools/root.zig");
 const memory_mod = @import("memory/root.zig");
 const subagent_mod = @import("subagent.zig");
+const subagent_runner = @import("subagent_runner.zig");
 const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
 const security = @import("security/policy.zig");
@@ -2429,6 +2431,11 @@ fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
     ctx.response_body = "{\"status\":\"ok\"}";
 }
 
+fn applyRuntimeProviderOverrides(config: *const Config) !void {
+    try http_util.setProxyOverride(config.http_request.proxy);
+    try providers.setApiErrorLimitOverride(config.diagnostics.api_error_max_chars);
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
 /// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, POST /qq
 /// If config_ptr is null, loads config internally (for backward compatibility).
@@ -2466,6 +2473,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
+        try applyRuntimeProviderOverrides(cfg);
         state.rate_limiter = GatewayRateLimiter.init(
             cfg.gateway.pair_rate_limit_per_minute,
             cfg.gateway.webhook_rate_limit_per_minute,
@@ -2548,6 +2556,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
                 if (subagent_manager) |mgr| {
                     mgr.* = subagent_mod.SubagentManager.init(allocator, cfg, event_bus, .{});
+                    mgr.task_runner = subagent_runner.runTaskWithTools;
                     subagent_manager_opt = mgr;
                 }
 
@@ -2583,6 +2592,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 session_mgr_opt = sm;
             }
         }
+    } else {
+        try http_util.setProxyOverride(null);
+        try providers.setApiErrorLimitOverride(null);
     }
     if (state.pairing_guard == null) {
         state.pairing_guard = try PairingGuard.init(allocator, true, &.{});

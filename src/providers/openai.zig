@@ -254,7 +254,7 @@ pub const OpenAiProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPost(allocator, BASE_URL, body, headers_buf[0..header_count]) catch return error.OpenAiApiError;
+        const resp_body = root.curlPostTimed(allocator, BASE_URL, body, headers_buf[0..header_count], 0) catch return error.OpenAiApiError;
         defer allocator.free(resp_body);
 
         return parseTextResponse(allocator, resp_body);

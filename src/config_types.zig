@@ -62,6 +62,9 @@ pub const DiagnosticsConfig = struct {
     backend: []const u8 = "none",
     otel_endpoint: ?[]const u8 = null,
     otel_service_name: ?[]const u8 = null,
+    /// Optional max length for user-visible provider/API errors after scrubbing.
+    /// If null, uses env var NULLCLAW_MAX_ERROR_CHARS (or built-in default).
+    api_error_max_chars: ?u32 = null,
     /// Emit info logs for every executed tool call (name/id/duration/success).
     /// Arguments and tool output are never logged.
     log_tool_calls: bool = false,
@@ -74,6 +77,15 @@ pub const DiagnosticsConfig = struct {
     /// Emit request/response payloads around provider chat calls.
     /// Intended for local debugging only (can include sensitive text).
     log_llm_io: bool = false,
+    /// Persist per-response token counters to a JSONL ledger near config.json.
+    /// This stores token counts only (provider/model/prompt/completion/total), not message text.
+    token_usage_ledger_enabled: bool = true,
+    /// Reset token usage ledger after this many hours. 0 disables time-based reset.
+    token_usage_ledger_window_hours: u32 = 24,
+    /// Maximum ledger file size before reset. 0 disables size-based reset.
+    token_usage_ledger_max_bytes: u64 = 0,
+    /// Maximum number of JSONL rows before reset. 0 disables row-limit reset.
+    token_usage_ledger_max_lines: u64 = 0,
 };
 
 pub const AutonomyConfig = struct {
@@ -1010,6 +1022,9 @@ pub const HttpRequestConfig = struct {
     max_response_size: u32 = 1_000_000,
     timeout_secs: u64 = 30,
     allowed_domains: []const []const u8 = &.{},
+    /// Optional outbound proxy URL used for provider/network curl requests.
+    /// Supported schemes: http://, https://, socks5://
+    proxy: ?[]const u8 = null,
     /// Optional SearXNG instance URL used by web_search as a fallback when
     /// BRAVE_API_KEY is not available.
     /// Examples:
@@ -1071,6 +1086,48 @@ pub const HttpRequestConfig = struct {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
         if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return false;
         return isValidSearchProviderName(trimmed);
+    }
+
+    pub fn isValidProxyUrl(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n") != null) return false;
+        if (std.mem.indexOfAny(u8, trimmed, "?#") != null) return false;
+
+        const uri = std.Uri.parse(trimmed) catch return false;
+        const scheme_ok = std.ascii.eqlIgnoreCase(uri.scheme, "http") or
+            std.ascii.eqlIgnoreCase(uri.scheme, "https") or
+            std.ascii.eqlIgnoreCase(uri.scheme, "socks5");
+        if (!scheme_ok) return false;
+
+        const host_comp = uri.host orelse return false;
+        const host = switch (host_comp) {
+            .raw => |h| h,
+            .percent_encoded => |h| blk: {
+                // Reject percent-escaped hosts like %31%32%37.0.0.1.
+                if (std.mem.indexOfScalar(u8, h, '%') != null) return false;
+                break :blk h;
+            },
+        };
+        if (host.len == 0) return false;
+        if (host[0] == ':') return false;
+        if (std.mem.indexOfAny(u8, host, " \t\r\n") != null) return false;
+
+        if (host[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
+            if (close != host.len - 1) return false;
+        }
+
+        if (uri.port) |port| {
+            if (port == 0) return false;
+        }
+
+        const path = switch (uri.path) {
+            .raw => |p| p,
+            .percent_encoded => |p| p,
+        };
+        if (path.len > 0 and !std.mem.eql(u8, path, "/")) return false;
+        return true;
     }
 };
 
@@ -1246,6 +1303,9 @@ test "WebConfig defaults" {
 }
 
 test "security defaults stay least-privilege" {
+    const diagnostics = DiagnosticsConfig{};
+    try std.testing.expect(diagnostics.api_error_max_chars == null);
+
     const autonomy = AutonomyConfig{};
     try std.testing.expectEqual(AutonomyLevel.supervised, autonomy.level);
     try std.testing.expect(autonomy.workspace_only);
@@ -1255,8 +1315,24 @@ test "security defaults stay least-privilege" {
 
     const http_request = HttpRequestConfig{};
     try std.testing.expect(!http_request.enabled);
+    try std.testing.expect(http_request.proxy == null);
     try std.testing.expect(http_request.search_base_url == null);
     try std.testing.expectEqualStrings("auto", http_request.search_provider);
+}
+
+test "HttpRequestConfig proxy URL validation" {
+    try std.testing.expect(HttpRequestConfig.isValidProxyUrl("http://127.0.0.1:8080"));
+    try std.testing.expect(HttpRequestConfig.isValidProxyUrl("https://proxy.example.com:8443"));
+    try std.testing.expect(HttpRequestConfig.isValidProxyUrl("socks5://127.0.0.1:1080"));
+    try std.testing.expect(HttpRequestConfig.isValidProxyUrl("http://proxy.example.com/"));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl(""));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("proxy.example.com:8080"));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("ftp://proxy.example.com:21"));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://"));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http:///"));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://:8080"));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://proxy.example.com/path"));
+    try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://proxy.example.com?x=1"));
 }
 
 test "WebConfig normalizePath trims and normalizes" {

@@ -64,6 +64,15 @@ ls -lh zig-out/bin/nullclaw
 
 ## Quick Start
 
+### 1) Recommended install (Homebrew)
+
+```bash
+brew install nullclaw
+nullclaw --help
+```
+
+### 2) Build from source
+
 > **Prerequisite:** use **Zig 0.15.2** (exact version).
 > `0.16.0-dev` and other Zig versions are currently unsupported and may fail to build.
 > Verify before building: `zig version` should print `0.15.2`.
@@ -72,6 +81,41 @@ ls -lh zig-out/bin/nullclaw
 git clone https://github.com/nullclaw/nullclaw.git
 cd nullclaw
 zig build -Doptimize=ReleaseSmall
+zig build test --summary all
+```
+
+Make `nullclaw` available on `PATH`:
+
+macOS/Linux (zsh/bash):
+
+```bash
+zig build -Doptimize=ReleaseSmall -p "$HOME/.local"
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+# or ~/.bashrc
+```
+
+Windows (PowerShell):
+
+```powershell
+zig build -Doptimize=ReleaseSmall -p "$HOME\.local"
+
+$bin = "$HOME\.local\bin"
+$user_path = [Environment]::GetEnvironmentVariable("Path", "User")
+if (-not ($user_path -split ";" | Where-Object { $_ -eq $bin })) {
+  [Environment]::SetEnvironmentVariable("Path", "$user_path;$bin", "User")
+}
+$env:Path = "$env:Path;$bin"
+```
+
+Then:
+
+```bash
+nullclaw --help
+```
+
+### 3) Common commands
+
+```bash
 
 # Quick setup
 nullclaw onboard --api-key sk-... --provider openrouter
@@ -111,8 +155,6 @@ nullclaw service status
 nullclaw migrate openclaw --dry-run
 nullclaw migrate openclaw
 ```
-
-> **Dev fallback (no global install):** prefix commands with `zig-out/bin/` (example: `zig-out/bin/nullclaw status`).
 
 ## Edge MVP (Hybrid Host + WASM Logic)
 
@@ -401,7 +443,9 @@ Use this when you want full web-search provider control plus unrestricted shell 
 - `http_request.search_provider` supports: `auto`, `searxng`, `duckduckgo` (`ddg`), `brave`, `firecrawl`, `tavily`, `perplexity`, `exa`, `jina`.
 - `http_request.search_fallback_providers` is optional and is tried in order when the primary provider fails.
 - Provider env vars: `BRAVE_API_KEY`, `FIRECRAWL_API_KEY`, `TAVILY_API_KEY`, `PERPLEXITY_API_KEY`, `EXA_API_KEY`, `JINA_API_KEY` (or shared `WEB_SEARCH_API_KEY` where supported). DuckDuckGo and SearXNG do not require API keys.
-- `allowed_commands: ["*"]` enables wildcard command allowlist matching.
+- `allowed_commands` entries support `"cmd"`, `"cmd *"`, and `"*"` formats.
+  - `"cmd"` and `"cmd *"` both allow that command family at the allowlist stage.
+  - `"*"` allows any command at the allowlist stage.
 - `allowed_paths: ["*"]` allows access outside workspace, except system-protected paths.
 
 ### Web UI / Browser Relay
