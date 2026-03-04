@@ -2590,6 +2590,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 if (sec_policy_opt) |*policy| {
                     sm.policy = policy;
                 }
+                sm.audit_logger = if (audit_logger_opt) |*logger| logger else null;
+                sm.audit_channel = "runtime";
                 if (mem_rt) |*rt| {
                     sm.mem_rt = rt;
                     tools_mod.bindMemoryRuntime(tools_slice, rt);

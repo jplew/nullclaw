@@ -287,6 +287,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
         var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
         agent.policy = &policy;
+        agent.audit_logger = if (audit_logger_opt) |*logger| logger else null;
+        agent.audit_channel = "cli";
         agent.session_store = if (mem_rt) |rt| rt.session_store else null;
         agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
         agent.mem_rt = if (mem_rt) |*rt| rt else null;
@@ -381,6 +383,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
     agent.policy = &policy;
+    agent.audit_logger = if (audit_logger_opt) |*logger| logger else null;
+    agent.audit_channel = "cli";
     agent.session_store = if (mem_rt) |rt| rt.session_store else null;
     agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
     agent.mem_rt = if (mem_rt) |*rt| rt else null;

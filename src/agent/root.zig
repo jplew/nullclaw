@@ -25,6 +25,7 @@ const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const security_audit = @import("../security/audit.zig");
 
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
@@ -290,6 +291,10 @@ pub const Agent = struct {
 
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
+    /// Optional security audit logger for structured tool-call records.
+    audit_logger: ?*const security_audit.AuditLogger = null,
+    /// Logical actor channel written into audit events.
+    audit_channel: []const u8 = "runtime",
 
     /// Optional streaming callback. When set, turn() uses streamChat() for streaming providers.
     stream_callback: ?providers.StreamCallback = null,
@@ -1215,6 +1220,7 @@ pub const Agent = struct {
                         .{ session_hash, idx + 1, call.name, result.success, tool_duration },
                     );
                 }
+                self.logToolCallAudit(call, result.success, tool_duration);
 
                 const tool_event = ObserverEvent{ .tool_call = .{
                     .tool = call.name,
@@ -1486,6 +1492,17 @@ pub const Agent = struct {
             .success = false,
             .tool_call_id = call.tool_call_id,
         };
+    }
+
+    fn logToolCallAudit(self: *Agent, call: ParsedToolCall, success: bool, duration_ms: u64) void {
+        const logger = self.audit_logger orelse return;
+        logger.logToolCall(.{
+            .channel = self.audit_channel,
+            .name = call.name,
+            .tool_call_id = call.tool_call_id,
+            .success = success,
+            .duration_ms = duration_ms,
+        }) catch {};
     }
 
     const LLM_LOG_MAX_BYTES: usize = 8192;

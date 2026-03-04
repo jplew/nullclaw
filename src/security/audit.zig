@@ -5,6 +5,7 @@ const audit_log = std.log.scoped(.audit);
 /// Audit event types
 pub const AuditEventType = enum {
     command_execution,
+    tool_call,
     file_access,
     config_change,
     auth_success,
@@ -15,6 +16,7 @@ pub const AuditEventType = enum {
     pub fn toString(self: AuditEventType) []const u8 {
         return switch (self) {
             .command_execution => "command_execution",
+            .tool_call => "tool_call",
             .file_access => "file_access",
             .config_change => "config_change",
             .auth_success => "auth_success",
@@ -36,8 +38,14 @@ pub const Actor = struct {
 pub const Action = struct {
     command: ?[]const u8 = null,
     risk_level: ?[]const u8 = null,
+    tool_call_id: ?[]const u8 = null,
     approved: bool,
     allowed: bool,
+};
+
+pub const ToolCallContext = struct {
+    name: []const u8,
+    tool_call_id: ?[]const u8 = null,
 };
 
 /// Execution result
@@ -70,6 +78,7 @@ pub const AuditEvent = struct {
     event_type: AuditEventType,
     actor: ?Actor = null,
     action: ?Action = null,
+    tool_call: ?ToolCallContext = null,
     result: ?ExecutionResult = null,
     security: SecurityContext = .{},
 
@@ -121,6 +130,15 @@ pub const AuditEvent = struct {
             .risk_level = risk_level,
             .approved = approved,
             .allowed = allowed,
+        };
+        return ev;
+    }
+
+    pub fn withToolCall(self: AuditEvent, name: []const u8, tool_call_id: ?[]const u8) AuditEvent {
+        var ev = self;
+        ev.tool_call = .{
+            .name = name,
+            .tool_call_id = tool_call_id,
         };
         return ev;
     }
@@ -201,8 +219,24 @@ pub const AuditEvent = struct {
                 try writeJsonString(writer, rl);
                 need_comma = true;
             }
+            if (act.tool_call_id) |tcid| {
+                if (need_comma) try writer.writeAll(",");
+                try writer.writeAll("\"tool_call_id\":");
+                try writeJsonString(writer, tcid);
+                need_comma = true;
+            }
             if (need_comma) try writer.writeAll(",");
             try writer.print("\"approved\":{},\"allowed\":{}", .{ act.approved, act.allowed });
+            try writer.writeAll("}");
+        }
+
+        if (self.tool_call) |tc| {
+            try writer.writeAll(",\"tool_call\":{\"name\":");
+            try writeJsonString(writer, tc.name);
+            if (tc.tool_call_id) |tcid| {
+                try writer.writeAll(",\"tool_call_id\":");
+                try writeJsonString(writer, tcid);
+            }
             try writer.writeAll("}");
         }
 
@@ -251,6 +285,14 @@ pub const CommandExecutionLog = struct {
     stderr: ?[]const u8 = null,
     stdout_truncated: bool = false,
     stderr_truncated: bool = false,
+};
+
+pub const ToolCallLog = struct {
+    channel: []const u8,
+    name: []const u8,
+    tool_call_id: ?[]const u8 = null,
+    success: bool,
+    duration_ms: u64,
 };
 
 /// Audit logger configuration
@@ -309,6 +351,14 @@ pub const AuditLogger = struct {
             .withAction(entry.command, entry.risk_level, entry.approved, entry.allowed)
             .withResult(entry.success, null, entry.duration_ms, null)
             .withOutput(entry.stdout, entry.stderr, entry.stdout_truncated, entry.stderr_truncated);
+        try self.log(&event);
+    }
+
+    pub fn logToolCall(self: *const AuditLogger, entry: ToolCallLog) !void {
+        var event = AuditEvent.init(.tool_call)
+            .withActor(entry.channel, null, null)
+            .withToolCall(entry.name, entry.tool_call_id)
+            .withResult(entry.success, null, entry.duration_ms, null);
         try self.log(&event);
     }
 
@@ -416,6 +466,7 @@ test "audit event serializes to json" {
 
 test "audit event type toString" {
     try std.testing.expectEqualStrings("command_execution", AuditEventType.command_execution.toString());
+    try std.testing.expectEqualStrings("tool_call", AuditEventType.tool_call.toString());
     try std.testing.expectEqualStrings("policy_violation", AuditEventType.policy_violation.toString());
     try std.testing.expectEqualStrings("auth_success", AuditEventType.auth_success.toString());
 }
@@ -442,9 +493,8 @@ test "audit logger disabled does not create file" {
 
 test "audit event types all have string representations" {
     const types = [_]AuditEventType{
-        .command_execution, .file_access,  .config_change,
-        .auth_success,      .auth_failure, .policy_violation,
-        .security_event,
+        .command_execution, .tool_call,    .file_access,      .config_change,
+        .auth_success,      .auth_failure, .policy_violation, .security_event,
     };
     for (types) |t| {
         const s = t.toString();
@@ -480,6 +530,19 @@ test "audit event with captured output" {
     const json = try ev.writeJson(&buf);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stdout\":\"line1\\nline2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stdout_truncated\":true") != null);
+}
+
+test "audit event with tool call context" {
+    const event = AuditEvent.init(.tool_call)
+        .withActor("runtime", null, null)
+        .withToolCall("memory_store", "tool-123")
+        .withResult(true, null, 11, null);
+
+    var buf: [2048]u8 = undefined;
+    var ev = event;
+    const json = try ev.writeJson(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"event_type\":\"tool_call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_call\":{\"name\":\"memory_store\",\"tool_call_id\":\"tool-123\"}") != null);
 }
 
 test "audit event with result error message" {
@@ -632,6 +695,31 @@ test "audit command execution log" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"stdout\":\"on branch main\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"stderr\":\"warn\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"stderr_truncated\":true") != null);
+}
+
+test "audit tool call log" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const config = AuditConfig{ .enabled = true, .log_path = "tool_audit.log" };
+    var logger = try AuditLogger.init(std.testing.allocator, config, tmp_path);
+    defer logger.deinit();
+
+    try logger.logToolCall(.{
+        .channel = "runtime",
+        .name = "web_search",
+        .tool_call_id = "call-42",
+        .success = true,
+        .duration_ms = 33,
+    });
+
+    const content = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "tool_audit.log", 4096);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"event_type\":\"tool_call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"name\":\"web_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"tool_call_id\":\"call-42\"") != null);
 }
 
 test "audit event ids are sequential" {

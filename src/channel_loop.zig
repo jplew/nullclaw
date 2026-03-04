@@ -444,6 +444,8 @@ pub const ChannelRuntime = struct {
         // Session manager
         var session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
         session_mgr.policy = security_policy;
+        session_mgr.audit_logger = audit_logger;
+        session_mgr.audit_channel = "runtime";
 
         // Self — heap-allocated so pointers remain stable
         const self = try allocator.create(ChannelRuntime);

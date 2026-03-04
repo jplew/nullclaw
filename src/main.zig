@@ -1746,6 +1746,8 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     // Initialize session manager
     var session_mgr = yc.session.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
     session_mgr.policy = &sec_policy;
+    session_mgr.audit_logger = if (audit_logger_opt) |*logger| logger else null;
+    session_mgr.audit_channel = "signal";
     if (mem_rt) |*rt| {
         session_mgr.mem_rt = rt;
     }
@@ -2088,6 +2090,8 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 
     var session_mgr = yc.session.SessionManager.init(allocator, &config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
     session_mgr.policy = &sec_policy;
+    session_mgr.audit_logger = if (audit_logger_opt) |*logger| logger else null;
+    session_mgr.audit_channel = "telegram";
     if (mem_rt) |*rt| {
         session_mgr.mem_rt = rt;
     }
