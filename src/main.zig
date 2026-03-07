@@ -1302,6 +1302,11 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
                 printEnabledMemoryBackends(allocator);
                 std.process.exit(1);
             },
+            error.CredentialsNotSet => {
+                std.debug.print("OpenAI Codex OAuth selected but no valid credential was found.\n", .{});
+                std.debug.print("Run `codex login` first, or `nullclaw auth login openai-codex --import-codex`.\n", .{});
+                std.process.exit(1);
+            },
             else => return err,
         },
     }

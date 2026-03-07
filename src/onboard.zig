@@ -18,6 +18,8 @@ const memory_root = @import("memory/root.zig");
 const http_util = @import("http_util.zig");
 const json_util = @import("json_util.zig");
 const util = @import("util.zig");
+const auth_mod = @import("auth.zig");
+const openai_codex = @import("providers/openai_codex.zig");
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -80,6 +82,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "openrouter", .label = "OpenRouter (multi-provider, recommended)", .default_model = "anthropic/claude-sonnet-4.6", .env_var = "OPENROUTER_API_KEY" },
     .{ .key = "anthropic", .label = "Anthropic (Claude direct)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
     .{ .key = "openai", .label = "OpenAI (GPT direct)", .default_model = "gpt-5.2", .env_var = "OPENAI_API_KEY" },
+    .{ .key = "openai-codex", .label = "OpenAI Codex (ChatGPT OAuth via Codex CLI token)", .default_model = "gpt-5.3-codex", .env_var = "OPENAI_API_KEY" },
 
     // --- Tier 2: Major cloud providers (Feb 2026 models) ---
     .{ .key = "gemini", .label = "Google Gemini", .default_model = "gemini-2.5-pro", .env_var = "GEMINI_API_KEY" },
@@ -234,6 +237,7 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "ollama")) return &ollama_fallback;
     if (std.mem.eql(u8, canonical, "claude-cli")) return &claude_cli_fallback;
     if (std.mem.eql(u8, canonical, "codex-cli")) return &codex_cli_fallback;
+    if (std.mem.eql(u8, canonical, "openai-codex")) return &openai_codex_fallback;
 
     // For providers without a curated fallback list, return a single-item fallback
     // based on the onboarding default model for that provider.
@@ -316,6 +320,29 @@ const codex_cli_fallback = [_][]const u8{
     "codex-mini-latest",
 };
 
+const openai_codex_fallback = [_][]const u8{
+    "gpt-5.3-codex",
+};
+
+fn isOAuthProvider(provider: []const u8) bool {
+    const canonical = canonicalProviderName(provider);
+    return std.mem.eql(u8, canonical, "openai-codex");
+}
+
+fn hasOpenAiCodexCredential(allocator: std.mem.Allocator) bool {
+    if (auth_mod.loadCredential(allocator, openai_codex.CREDENTIAL_KEY) catch null) |token| {
+        defer token.deinit(allocator);
+        return true;
+    }
+
+    if (openai_codex.tryLoadCodexCliToken(allocator)) |token| {
+        defer token.deinit(allocator);
+        return true;
+    }
+
+    return false;
+}
+
 const MAX_MODELS = 20;
 
 /// Return a heap-allocated copy of the static fallback list for a provider.
@@ -367,7 +394,8 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
         std.mem.eql(u8, canonical, "deepseek") or
         std.mem.eql(u8, canonical, "ollama") or
         std.mem.eql(u8, canonical, "claude-cli") or
-        std.mem.eql(u8, canonical, "codex-cli"))
+        std.mem.eql(u8, canonical, "codex-cli") or
+        std.mem.eql(u8, canonical, "openai-codex"))
     {
         const fallback = fallbackModelsForProvider(canonical);
         var result: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -654,6 +682,11 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
             custom_base_url = info.key["custom:".len..];
         }
     }
+
+    if (isOAuthProvider(cfg.default_provider) and !hasOpenAiCodexCredential(allocator)) {
+        return error.CredentialsNotSet;
+    }
+
     if (api_key) |key| {
         // Store in providers section for the default provider (arena frees old values)
         const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
@@ -705,10 +738,18 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     if (cfg.default_model) |m| {
         try stdout.print("  [OK] Model:      {s}\n", .{m});
     }
-    try stdout.print("  [OK] API Key:    {s}\n", .{if (cfg.defaultProviderKey() != null) "set" else "not set (use --api-key or edit config)"});
+    if (isOAuthProvider(cfg.default_provider)) {
+        try stdout.writeAll("  [OK] Auth:       OpenAI OAuth token available (Codex CLI fallback enabled)\n");
+    } else {
+        try stdout.print("  [OK] API Key:    {s}\n", .{if (cfg.defaultProviderKey() != null) "set" else "not set (use --api-key or edit config)"});
+    }
     try stdout.print("  [OK] Memory:     {s}\n", .{cfg.memory.backend});
     try stdout.writeAll("\n  Next steps:\n");
-    if (cfg.defaultProviderKey() == null) {
+    if (isOAuthProvider(cfg.default_provider)) {
+        try stdout.writeAll("    1. Chat:     nullclaw agent -m \"Hello!\"\n");
+        try stdout.writeAll("    2. Gateway:  nullclaw gateway\n");
+        try stdout.writeAll("    3. Status:   nullclaw auth status openai-codex\n");
+    } else if (cfg.defaultProviderKey() == null) {
         const env_hint = providerEnvVar(cfg.default_provider);
         try stdout.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{env_hint});
         try stdout.writeAll("    2. Chat:              nullclaw agent -m \"Hello!\"\n");
@@ -1438,6 +1479,13 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         const provider = known_providers[provider_idx];
         cfg.default_provider = provider.key;
         try out.print("  -> {s}\n\n", .{provider.label});
+
+        if (isOAuthProvider(cfg.default_provider) and !hasOpenAiCodexCredential(allocator)) {
+            try out.writeAll("  Error: no valid OpenAI Codex OAuth token found.\n");
+            try out.writeAll("  Run `codex login` first, or `nullclaw auth login openai-codex --import-codex`.\n\n");
+            try out.flush();
+            return;
+        }
     } else {
         // Custom provider - prompt for URL
         var custom_url_buf: [512]u8 = undefined;
@@ -1469,30 +1517,35 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         try out.print("  -> Custom: {s}\n\n", .{custom_url});
     }
 
-    // ── Step 2: API key ──
+    // ── Step 2: API key (or OAuth credential check) ──
     const env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
-    try out.print("  Step 2/8: Enter API key (or press Enter to use env var {s}): ", .{env_hint});
-    const api_key_input = prompt(out, &input_buf, "", "") orelse {
-        try out.writeAll("\n  Aborted.\n");
-        try out.flush();
-        return;
-    };
-    if (api_key_input.len > 0) {
-        // Store in providers section (preserve base_url if already set for custom provider)
-        const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-        var base_url: ?[]const u8 = null;
-        if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
-            base_url = cfg.providers[0].base_url;
-        }
-        entries[0] = .{
-            .name = try cfg.allocator.dupe(u8, cfg.default_provider),
-            .api_key = try cfg.allocator.dupe(u8, api_key_input),
-            .base_url = base_url,
-        };
-        cfg.providers = entries;
-        try out.writeAll("  -> API key set\n\n");
+    if (isOAuthProvider(cfg.default_provider)) {
+        try out.writeAll("  Step 2/8: OpenAI OAuth token\n");
+        try out.writeAll("  -> Using existing Codex CLI/Nullclaw credential (no API key required)\n\n");
     } else {
-        try out.print("  -> Will use ${s} from environment\n\n", .{env_hint});
+        try out.print("  Step 2/8: Enter API key (or press Enter to use env var {s}): ", .{env_hint});
+        const api_key_input = prompt(out, &input_buf, "", "") orelse {
+            try out.writeAll("\n  Aborted.\n");
+            try out.flush();
+            return;
+        };
+        if (api_key_input.len > 0) {
+            // Store in providers section (preserve base_url if already set for custom provider)
+            const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
+            var base_url: ?[]const u8 = null;
+            if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
+                base_url = cfg.providers[0].base_url;
+            }
+            entries[0] = .{
+                .name = try cfg.allocator.dupe(u8, cfg.default_provider),
+                .api_key = try cfg.allocator.dupe(u8, api_key_input),
+                .base_url = base_url,
+            };
+            cfg.providers = entries;
+            try out.writeAll("  -> API key set\n\n");
+        } else {
+            try out.print("  -> Will use ${s} from environment\n\n", .{env_hint});
+        }
     }
 
     // ── Step 3: Model (with live fetching) ──
@@ -1705,13 +1758,21 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     if (cfg.default_model) |m| {
         try out.print("  [OK] Model:      {s}\n", .{m});
     }
-    try out.print("  [OK] API Key:    {s}\n", .{if (cfg.defaultProviderKey() != null) "set" else "from environment"});
+    if (isOAuthProvider(cfg.default_provider)) {
+        try out.writeAll("  [OK] Auth:       OpenAI OAuth token available\n");
+    } else {
+        try out.print("  [OK] API Key:    {s}\n", .{if (cfg.defaultProviderKey() != null) "set" else "from environment"});
+    }
     try out.print("  [OK] Memory:     {s}\n", .{cfg.memory.backend});
     try out.print("  [OK] Tunnel:     {s}\n", .{cfg.tunnel.provider});
     try out.print("  [OK] Workspace:  {s}\n", .{cfg.workspace_dir});
     try out.print("  [OK] Config:     {s}\n", .{cfg.config_path});
     try out.writeAll("\n  Next steps:\n");
-    if (cfg.defaultProviderKey() == null) {
+    if (isOAuthProvider(cfg.default_provider)) {
+        try out.writeAll("    1. Chat:              nullclaw agent -m \"Hello!\"\n");
+        try out.writeAll("    2. Gateway:           nullclaw gateway\n");
+        try out.writeAll("    3. Auth status:       nullclaw auth status openai-codex\n");
+    } else if (cfg.defaultProviderKey() == null) {
         // Recalculate env_hint for the final display
         const final_env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
         try out.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{final_env_hint});
@@ -2389,6 +2450,7 @@ test "canonicalProviderName handles aliases" {
 test "defaultModelForProvider returns known models" {
     try std.testing.expectEqualStrings("claude-opus-4-6", defaultModelForProvider("anthropic"));
     try std.testing.expectEqualStrings("gpt-5.2", defaultModelForProvider("openai"));
+    try std.testing.expectEqualStrings("gpt-5.3-codex", defaultModelForProvider("openai-codex"));
     try std.testing.expectEqualStrings("deepseek-chat", defaultModelForProvider("deepseek"));
     try std.testing.expectEqualStrings("llama4", defaultModelForProvider("ollama"));
 }
@@ -2401,6 +2463,7 @@ test "providerEnvVar known providers" {
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", providerEnvVar("openrouter"));
     try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", providerEnvVar("anthropic"));
     try std.testing.expectEqualStrings("OPENAI_API_KEY", providerEnvVar("openai"));
+    try std.testing.expectEqualStrings("OPENAI_API_KEY", providerEnvVar("openai-codex"));
     try std.testing.expectEqualStrings("API_KEY", providerEnvVar("ollama"));
 }
 
@@ -3036,7 +3099,7 @@ test "catalog_providers names are unique" {
 test "wizard promptChoice returns default for out-of-range" {
     // This tests the logic without actual I/O by validating the
     // boundary: max providers is known_providers.len
-    try std.testing.expect(known_providers.len == 32);
+    try std.testing.expect(known_providers.len == 33);
     // The wizard would clamp to default (0) for out of range input
 }
 
@@ -3361,6 +3424,16 @@ test "fetchModelsFromApi returns hardcoded for anthropic" {
     try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
     try std.testing.expectEqualStrings("claude-sonnet-4-6", models[1]);
     try std.testing.expectEqualStrings("claude-haiku-4-5", models[2]);
+}
+
+test "fetchModelsFromApi returns hardcoded for openai-codex" {
+    const models = try fetchModelsFromApi(std.testing.allocator, "openai-codex", null);
+    defer {
+        for (models) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(models);
+    }
+    try std.testing.expect(models.len >= 1);
+    try std.testing.expectEqualStrings("gpt-5.3-codex", models[0]);
 }
 
 test "fetchModelsFromApi returns hardcoded for ollama" {
