@@ -7,6 +7,7 @@
 const std = @import("std");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
+const bootstrap_mod = @import("../bootstrap/root.zig");
 
 // ── JSON arg extraction helpers ─────────────────────────────────
 // Used by all tool implementations to extract typed fields from
@@ -296,6 +297,8 @@ pub fn allTools(
         audit_channel: []const u8 = "runtime",
         audit_capture_shell_output: bool = false,
         audit_max_output_bytes: usize = 2048,
+        bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
+        backend_name: []const u8 = "hybrid",
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -328,11 +331,22 @@ pub fn allTools(
     try list.append(allocator, ft.tool());
 
     const wt = try allocator.create(file_write.FileWriteTool);
-    wt.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
+    wt.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, wt.tool());
 
     const et2 = try allocator.create(file_edit.FileEditTool);
-    et2.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths, .max_file_size = tc.max_file_size_bytes };
+    et2.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, et2.tool());
 
     const gt = try allocator.create(git.GitTool);
@@ -402,7 +416,10 @@ pub fn allTools(
         try list.append(allocator, wst.tool());
 
         const wft = try allocator.create(web_fetch.WebFetchTool);
-        wft.* = .{ .default_max_chars = tc.web_fetch_max_chars };
+        wft.* = .{
+            .default_max_chars = tc.web_fetch_max_chars,
+            .allowed_domains = opts.http_allowed_domains,
+        };
         try list.append(allocator, wft.tool());
     }
 
@@ -517,6 +534,8 @@ pub fn subagentTools(
         tools_config: @import("../config.zig").ToolsConfig = .{},
         audit_capture_shell_output: bool = false,
         audit_max_output_bytes: usize = 2048,
+        bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
+        backend_name: []const u8 = "hybrid",
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -552,7 +571,12 @@ pub fn subagentTools(
     try list.append(allocator, ft.tool());
 
     const wt = try allocator.create(file_write.FileWriteTool);
-    wt.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
+    wt.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, wt.tool());
 
     const et = try allocator.create(file_edit.FileEditTool);
@@ -560,6 +584,8 @@ pub fn subagentTools(
         .workspace_dir = workspace_dir,
         .allowed_paths = opts.allowed_paths,
         .max_file_size = tc.max_file_size_bytes,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
     };
     try list.append(allocator, et.tool());
 
@@ -761,6 +787,7 @@ test "all tools wires http and web_search config into tool instances" {
 
     var saw_http = false;
     var saw_search = false;
+    var saw_fetch = false;
     for (tools) |t| {
         if (std.mem.eql(u8, t.name(), "http_request")) {
             const ht: *http_request.HttpRequestTool = @ptrCast(@alignCast(t.ptr));
@@ -778,11 +805,19 @@ test "all tools wires http and web_search config into tool instances" {
             try std.testing.expectEqualStrings("jina", wst.fallback_providers[0]);
             try std.testing.expectEqual(@as(u64, 12), wst.timeout_secs);
             saw_search = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "web_fetch")) {
+            const wft: *web_fetch.WebFetchTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(usize, 2), wft.allowed_domains.len);
+            try std.testing.expectEqualStrings("example.com", wft.allowed_domains[0]);
+            saw_fetch = true;
         }
     }
 
     try std.testing.expect(saw_http);
     try std.testing.expect(saw_search);
+    try std.testing.expect(saw_fetch);
 }
 
 test "all tools wires subagent manager into spawn tool" {

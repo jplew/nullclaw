@@ -7,6 +7,8 @@ const providers = @import("providers/root.zig");
 const security = @import("security/policy.zig");
 const subagent_mod = @import("subagent.zig");
 const tools_mod = @import("tools/root.zig");
+const memory_mod = @import("memory/root.zig");
+const bootstrap_mod = @import("bootstrap/root.zig");
 
 fn findProviderEntry(
     provider_name: []const u8,
@@ -45,12 +47,25 @@ pub fn runTaskWithTools(
         .autonomy = request.autonomy,
         .workspace_dir = request.workspace_dir,
         .workspace_only = request.workspace_only,
-        .allowed_commands = if (request.allowed_commands.len > 0) request.allowed_commands else &security.default_allowed_commands,
+        .allowed_commands = security.resolveAllowedCommands(request.autonomy, request.allowed_commands),
         .max_actions_per_hour = request.max_actions_per_hour,
         .require_approval_for_medium_risk = request.require_approval_for_medium_risk,
         .block_high_risk_commands = request.block_high_risk_commands,
+        .allow_raw_url_chars = request.allow_raw_url_chars,
         .tracker = &tracker,
     };
+
+    var mem_rt = memory_mod.initRuntime(allocator, &request.memory_config, request.workspace_dir);
+    defer if (mem_rt) |*rt| rt.deinit();
+    const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
+
+    const bootstrap_provider: ?bootstrap_mod.BootstrapProvider = bootstrap_mod.createProvider(
+        allocator,
+        request.memory_config.backend,
+        mem_opt,
+        request.workspace_dir,
+    ) catch null;
+    defer if (bootstrap_provider) |bp| bp.deinit();
 
     const tools = try tools_mod.subagentTools(allocator, request.workspace_dir, .{
         .http_enabled = request.http_enabled,
@@ -59,6 +74,8 @@ pub fn runTaskWithTools(
         .allowed_paths = request.allowed_paths,
         .policy = &policy,
         .tools_config = request.tools_config,
+        .bootstrap_provider = bootstrap_provider,
+        .backend_name = request.memory_config.backend,
     });
     defer tools_mod.deinitTools(allocator, tools);
 
@@ -71,6 +88,8 @@ pub fn runTaskWithTools(
         .default_model = effective_model,
         .default_temperature = request.temperature,
         .providers = request.configured_providers,
+        .memory = request.memory_config,
+        .memory_backend = request.memory_config.backend,
         .agent = .{
             .max_tool_iterations = request.max_tool_iterations,
         },
@@ -80,6 +99,7 @@ pub fn runTaskWithTools(
             .max_actions_per_hour = request.max_actions_per_hour,
             .require_approval_for_medium_risk = request.require_approval_for_medium_risk,
             .block_high_risk_commands = request.block_high_risk_commands,
+            .allow_raw_url_chars = request.allow_raw_url_chars,
             .allowed_commands = request.allowed_commands,
             .allowed_paths = request.allowed_paths,
         },
@@ -97,7 +117,7 @@ pub fn runTaskWithTools(
         &cfg,
         provider_holder.provider(),
         tools,
-        null,
+        mem_opt,
         noop_obs.observer(),
     );
     defer agent.deinit();
@@ -119,7 +139,7 @@ pub fn runTaskWithTools(
     });
     agent.has_system_prompt = true;
     agent.system_prompt_has_conversation_context = false;
-    agent.workspace_prompt_fingerprint = agent_mod.prompt.workspacePromptFingerprint(allocator, request.workspace_dir) catch null;
+    agent.workspace_prompt_fingerprint = agent_mod.prompt.workspacePromptFingerprint(allocator, request.workspace_dir, agent.bootstrap) catch null;
 
     return agent.turn(request.task);
 }

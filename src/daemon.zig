@@ -19,6 +19,8 @@ const agent_routing = @import("agent_routing.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const heartbeat_mod = @import("heartbeat.zig");
+const memory_mod = @import("memory/root.zig");
+const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
 
@@ -156,12 +158,27 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
     const state_path = stateFilePath(allocator, config) catch return;
     defer allocator.free(state_path);
 
-    const heartbeat_engine = heartbeat_mod.HeartbeatEngine.init(
+    var heartbeat_mem_rt: ?memory_mod.MemoryRuntime = null;
+    if (!memory_mod.usesWorkspaceBootstrapFiles(config.memory.backend)) {
+        heartbeat_mem_rt = memory_mod.initRuntime(allocator, &config.memory, config.workspace_dir);
+    }
+    defer if (heartbeat_mem_rt) |*rt| rt.deinit();
+    const heartbeat_mem_opt: ?memory_mod.Memory = if (heartbeat_mem_rt) |rt| rt.memory else null;
+
+    var heartbeat_engine = heartbeat_mod.HeartbeatEngine.init(
         config.heartbeat.enabled,
         config.heartbeat.interval_minutes,
         config.workspace_dir,
         null,
     );
+    heartbeat_engine.bootstrap_provider = bootstrap_mod.createProvider(
+        allocator,
+        config.memory.backend,
+        heartbeat_mem_opt,
+        config.workspace_dir,
+    ) catch null;
+    defer if (heartbeat_engine.bootstrap_provider) |bp| bp.deinit();
+
     const heartbeat_interval_ns: i128 = @as(i128, @intCast(heartbeat_engine.interval_minutes)) * 60 * std.time.ns_per_s;
     var next_heartbeat_tick_at_ns: i128 = std.time.nanoTimestamp() + heartbeat_interval_ns;
 
@@ -692,7 +709,7 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web");
+        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web") or std.mem.eql(u8, msg.channel, "telegram");
         var streaming_ctx = StreamingOutboundCtx{
             .allocator = allocator,
             .event_bus = event_bus,
@@ -700,18 +717,26 @@ fn inboundDispatcherThread(
             .account_id = outbound_account_id,
             .chat_id = msg.chat_id,
         };
+        var stream_sink: ?streaming.Sink = null;
+        var outbound_tag_filter: streaming.TagFilter = undefined;
+        if (use_streaming_outbound) {
+            const raw_sink = streaming.Sink{
+                .callback = publishStreamingChunk,
+                .ctx = @ptrCast(&streaming_ctx),
+            };
+            if (std.mem.eql(u8, msg.channel, "telegram")) {
+                outbound_tag_filter = streaming.TagFilter.init(raw_sink);
+                stream_sink = outbound_tag_filter.sink();
+            } else {
+                stream_sink = raw_sink;
+            }
+        }
 
         const reply = runtime.session_mgr.processMessageStreaming(
             session_key,
             msg.content,
             null,
-            if (use_streaming_outbound)
-                streaming.Sink{
-                    .callback = publishStreamingChunk,
-                    .ctx = @ptrCast(&streaming_ctx),
-                }
-            else
-                null,
+            stream_sink,
         ) catch |err| {
             log.warn("inbound dispatch process failed: {}", .{err});
 
@@ -768,7 +793,7 @@ fn inboundDispatcherThread(
 pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16) !void {
     // Ensure lifecycle parity: workspace bootstrap files must exist
     // even when users skip onboard and start runtime directly.
-    try onboard.scaffoldWorkspace(allocator, config.workspace_dir, &onboard.ProjectContext{});
+    try onboard.scaffoldWorkspace(allocator, config.workspace_dir, &onboard.ProjectContext{}, null);
 
     health.markComponentOk("daemon");
     shutdown_requested.store(false, .release);

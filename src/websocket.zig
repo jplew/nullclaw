@@ -151,6 +151,7 @@ pub const WsClient = struct {
         // WS frame immediately after the 101 response.
         var resp_buf: [4096]u8 = undefined;
         var resp_len: usize = 0;
+        var headers_complete = false;
         while (resp_len < resp_buf.len) {
             // Use take(1) which always fills the internal buffer first,
             // then returns a pointer into it — consuming exactly one byte.
@@ -165,8 +166,13 @@ pub const WsClient = struct {
                 resp_buf[resp_len - 2] == '\r' and
                 resp_buf[resp_len - 1] == '\n')
             {
+                headers_complete = true;
                 break;
             }
+        }
+        if (!headers_complete) {
+            log.err("WS handshake: header block exceeded {d} bytes", .{resp_buf.len});
+            return error.WsHandshakeFailed;
         }
         const resp = resp_buf[0..resp_len];
         if (!std.mem.startsWith(u8, resp, "HTTP/1.1 101")) {
@@ -264,8 +270,7 @@ pub const WsClient = struct {
                         log.warn("WS auto-pong failed: {}", .{err});
                     };
                 }
-                if (plen > 0) self.allocator.free(payload);
-                return Frame{ .opcode = .ping, .fin = true, .payload = @constCast(&[_]u8{}) };
+                return Frame{ .opcode = .ping, .fin = true, .payload = payload };
             },
             .close => {
                 if (plen > 0) self.allocator.free(payload);

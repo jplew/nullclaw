@@ -1,6 +1,7 @@
 const std = @import("std");
 const zig_builtin = @import("builtin");
 const platform = @import("platform.zig");
+const json_miniparse = @import("json_miniparse.zig");
 
 // Skills — user-defined capabilities loaded from disk.
 //
@@ -51,50 +52,12 @@ pub const SkillManifest = struct {
 /// Extract a string field value from a JSON blob (minimal parser — no allocations).
 /// Same pattern as tools/shell.zig parseStringField.
 fn parseStringField(json: []const u8, key: []const u8) ?[]const u8 {
-    var needle_buf: [256]u8 = undefined;
-    const quoted_key = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{key}) catch return null;
-
-    const key_pos = std.mem.indexOf(u8, json, quoted_key) orelse return null;
-    const after_key = json[key_pos + quoted_key.len ..];
-
-    // Skip whitespace and colon
-    var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or
-        after_key[i] == '\t' or after_key[i] == '\n')) : (i += 1)
-    {}
-
-    if (i >= after_key.len or after_key[i] != '"') return null;
-    i += 1; // skip opening quote
-
-    // Find closing quote (handle escaped quotes)
-    const start = i;
-    while (i < after_key.len) : (i += 1) {
-        if (after_key[i] == '\\' and i + 1 < after_key.len) {
-            i += 1; // skip escaped char
-            continue;
-        }
-        if (after_key[i] == '"') {
-            return after_key[start..i];
-        }
-    }
-    return null;
+    return json_miniparse.parseStringField(json, key);
 }
 
 /// Extract a boolean field value from a JSON blob (true/false literal).
 fn parseBoolField(json: []const u8, key: []const u8) ?bool {
-    var needle_buf: [256]u8 = undefined;
-    const quoted_key = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{key}) catch return null;
-    const key_pos = std.mem.indexOf(u8, json, quoted_key) orelse return null;
-    const after_key = json[key_pos + quoted_key.len ..];
-
-    var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or
-        after_key[i] == '\t' or after_key[i] == '\n')) : (i += 1)
-    {}
-
-    if (i + 4 <= after_key.len and std.mem.eql(u8, after_key[i..][0..4], "true")) return true;
-    if (i + 5 <= after_key.len and std.mem.eql(u8, after_key[i..][0..5], "false")) return false;
-    return null;
+    return json_miniparse.parseBoolField(json, key);
 }
 
 /// Parse a JSON string array field, returning allocated slices.
@@ -1584,25 +1547,7 @@ pub const CommunitySkillsSync = struct {
 
 /// Parse integer field from minimal JSON like {"last_sync": 12345}.
 fn parseIntField(json: []const u8, key: []const u8) ?i64 {
-    var needle_buf: [256]u8 = undefined;
-    const quoted_key = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{key}) catch return null;
-
-    const key_pos = std.mem.indexOf(u8, json, quoted_key) orelse return null;
-    const after_key = json[key_pos + quoted_key.len ..];
-
-    // Skip whitespace and colon
-    var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or
-        after_key[i] == '\t' or after_key[i] == '\n')) : (i += 1)
-    {}
-
-    if (i >= after_key.len) return null;
-
-    const start = i;
-    while (i < after_key.len and (after_key[i] >= '0' and after_key[i] <= '9')) : (i += 1) {}
-    if (i == start) return null;
-
-    return std.fmt.parseInt(i64, after_key[start..i], 10) catch null;
+    return json_miniparse.parseIntField(json, key);
 }
 
 /// Read the last_sync timestamp from a marker file.

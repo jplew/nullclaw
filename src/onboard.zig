@@ -9,6 +9,7 @@
 //!   - Provider/model selection with curated defaults
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("platform.zig");
 const config_mod = @import("config.zig");
@@ -20,6 +21,7 @@ const json_util = @import("json_util.zig");
 const util = @import("util.zig");
 const auth_mod = @import("auth.zig");
 const openai_codex = @import("providers/openai_codex.zig");
+const bootstrap_mod = @import("bootstrap/root.zig");
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -86,6 +88,7 @@ pub const known_providers = [_]ProviderInfo{
 
     // --- Tier 2: Major cloud providers (Feb 2026 models) ---
     .{ .key = "gemini", .label = "Google Gemini", .default_model = "gemini-2.5-pro", .env_var = "GEMINI_API_KEY" },
+    .{ .key = "vertex", .label = "Google Vertex AI (Gemini)", .default_model = "gemini-2.5-pro", .env_var = "VERTEX_API_KEY" },
     .{ .key = "deepseek", .label = "DeepSeek", .default_model = "deepseek-chat", .env_var = "DEEPSEEK_API_KEY" },
     .{ .key = "groq", .label = "Groq (fast inference)", .default_model = "llama-3.3-70b-versatile", .env_var = "GROQ_API_KEY" },
 
@@ -137,6 +140,7 @@ pub fn canonicalProviderName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "grok")) return "xai";
     if (std.mem.eql(u8, name, "together")) return "together-ai";
     if (std.mem.eql(u8, name, "google") or std.mem.eql(u8, name, "google-gemini")) return "gemini";
+    if (std.mem.eql(u8, name, "vertex-ai") or std.mem.eql(u8, name, "google-vertex")) return "vertex";
     if (std.mem.eql(u8, name, "claude-code")) return "claude-cli";
     return name;
 }
@@ -233,6 +237,7 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "groq")) return &groq_fallback;
     if (std.mem.eql(u8, canonical, "anthropic")) return &anthropic_fallback;
     if (std.mem.eql(u8, canonical, "gemini")) return &gemini_fallback;
+    if (std.mem.eql(u8, canonical, "vertex")) return &vertex_fallback;
     if (std.mem.eql(u8, canonical, "deepseek")) return &deepseek_fallback;
     if (std.mem.eql(u8, canonical, "ollama")) return &ollama_fallback;
     if (std.mem.eql(u8, canonical, "claude-cli")) return &claude_cli_fallback;
@@ -297,6 +302,11 @@ const anthropic_fallback = [_][]const u8{
     "claude-haiku-4-5",
 };
 const gemini_fallback = [_][]const u8{
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+};
+const vertex_fallback = [_][]const u8{
     "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
@@ -391,6 +401,7 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
     // Providers with no models-list API
     if (std.mem.eql(u8, canonical, "anthropic") or
         std.mem.eql(u8, canonical, "gemini") or
+        std.mem.eql(u8, canonical, "vertex") or
         std.mem.eql(u8, canonical, "deepseek") or
         std.mem.eql(u8, canonical, "ollama") or
         std.mem.eql(u8, canonical, "claude-cli") or
@@ -727,7 +738,7 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     };
 
     // Scaffold workspace files
-    try scaffoldWorkspace(allocator, cfg.workspace_dir, &ProjectContext{});
+    try scaffoldWorkspace(allocator, cfg.workspace_dir, &ProjectContext{}, null);
 
     // Save config so subsequent commands can find it
     try cfg.save();
@@ -889,6 +900,7 @@ fn promptChoice(out: *std.Io.Writer, buf: []u8, max: usize, default_idx: usize) 
 pub const tunnel_options = [_][]const u8{ "none", "cloudflare", "ngrok", "tailscale" };
 pub const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_autonomous" };
 pub const wizard_memory_backend_order = [_][]const u8{
+    "hybrid",
     "sqlite",
     "markdown",
     "memory",
@@ -915,6 +927,7 @@ fn selectableBackendsForWizard(allocator: std.mem.Allocator) ![]const *const mem
 }
 
 pub fn memoryProfileForBackend(backend: []const u8) []const u8 {
+    if (std.mem.eql(u8, backend, "hybrid")) return "hybrid_keyword";
     if (std.mem.eql(u8, backend, "sqlite")) return "local_keyword";
     if (std.mem.eql(u8, backend, "markdown")) return "markdown_only";
     if (std.mem.eql(u8, backend, "postgres")) return "postgres_keyword";
@@ -1747,7 +1760,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     };
 
     // Scaffold workspace files
-    try scaffoldWorkspace(allocator, cfg.workspace_dir, &ProjectContext{});
+    try scaffoldWorkspace(allocator, cfg.workspace_dir, &ProjectContext{}, null);
 
     // Save config
     try cfg.save();
@@ -1932,7 +1945,14 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
 // ── Workspace scaffolding ────────────────────────────────────────
 
 /// Create essential workspace files if they don't already exist.
-pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8, ctx: *const ProjectContext) !void {
+/// When a `bootstrap_provider` is supplied and the backend does not use
+/// files, documents are written through the provider instead of to disk.
+pub fn scaffoldWorkspace(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    ctx: *const ProjectContext,
+    bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
+) !void {
     if (std.fs.path.dirname(workspace_dir)) |parent| {
         std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
@@ -1949,26 +1969,26 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
     // SOUL.md (personality traits — loaded by prompt.zig)
     const soul_tmpl = try soulTemplate(allocator, ctx);
     defer allocator.free(soul_tmpl);
-    try writeIfMissing(allocator, workspace_dir, "SOUL.md", soul_tmpl);
+    try storeOrWriteIfMissing(allocator, workspace_dir, "SOUL.md", soul_tmpl, bootstrap_provider);
 
     // AGENTS.md (operational guidelines — loaded by prompt.zig)
-    try writeIfMissing(allocator, workspace_dir, "AGENTS.md", agentsTemplate());
+    try storeOrWriteIfMissing(allocator, workspace_dir, "AGENTS.md", agentsTemplate(), bootstrap_provider);
 
     // TOOLS.md (tool usage guide — loaded by prompt.zig)
-    try writeIfMissing(allocator, workspace_dir, "TOOLS.md", toolsTemplate());
+    try storeOrWriteIfMissing(allocator, workspace_dir, "TOOLS.md", toolsTemplate(), bootstrap_provider);
 
     // IDENTITY.md (identity config — loaded by prompt.zig)
     const identity_tmpl = try identityTemplate(allocator, ctx);
     defer allocator.free(identity_tmpl);
-    try writeIfMissing(allocator, workspace_dir, "IDENTITY.md", identity_tmpl);
+    try storeOrWriteIfMissing(allocator, workspace_dir, "IDENTITY.md", identity_tmpl, bootstrap_provider);
 
     // USER.md (user profile — loaded by prompt.zig)
     const user_tmpl = try userTemplate(allocator, ctx);
     defer allocator.free(user_tmpl);
-    try writeIfMissing(allocator, workspace_dir, "USER.md", user_tmpl);
+    try storeOrWriteIfMissing(allocator, workspace_dir, "USER.md", user_tmpl, bootstrap_provider);
 
     // HEARTBEAT.md (periodic tasks — loaded by prompt.zig)
-    try writeIfMissing(allocator, workspace_dir, "HEARTBEAT.md", heartbeatTemplate());
+    try storeOrWriteIfMissing(allocator, workspace_dir, "HEARTBEAT.md", heartbeatTemplate(), bootstrap_provider);
 
     // BOOTSTRAP.md lifecycle:
     // one-shot onboarding instructions with persisted state marker.
@@ -1993,6 +2013,7 @@ pub fn resetWorkspacePromptFiles(
     workspace_dir: []const u8,
     ctx: *const ProjectContext,
     options: ResetWorkspacePromptFilesOptions,
+    bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
 ) !ResetWorkspacePromptFilesReport {
     if (std.fs.path.dirname(workspace_dir)) |parent| {
         std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
@@ -2027,11 +2048,17 @@ pub fn resetWorkspacePromptFiles(
     };
 
     for (files) |entry| {
+        if (bootstrap_provider) |bp| {
+            if (!options.dry_run) try bp.store(entry.filename, entry.content);
+        }
         _ = try overwriteWorkspaceFile(allocator, workspace_dir, entry.filename, entry.content, options.dry_run);
         report.rewritten_files += 1;
     }
 
     if (options.include_bootstrap) {
+        if (bootstrap_provider) |bp| {
+            if (!options.dry_run) try bp.store("BOOTSTRAP.md", bootstrapTemplate());
+        }
         _ = try overwriteWorkspaceFile(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate(), options.dry_run);
         report.rewritten_files += 1;
     }
@@ -2055,7 +2082,7 @@ fn overwriteWorkspaceFile(
     content: []const u8,
     dry_run: bool,
 ) !bool {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_dir, filename });
+    const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
     defer allocator.free(path);
 
     if (dry_run) return true;
@@ -2072,7 +2099,7 @@ fn removeWorkspaceFileIfExists(
     filename: []const u8,
     dry_run: bool,
 ) !bool {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_dir, filename });
+    const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
     defer allocator.free(path);
 
     if (dry_run) {
@@ -2087,7 +2114,7 @@ fn removeWorkspaceFileIfExists(
 }
 
 fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8, content: []const u8) !void {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, filename });
+    const path = try std.fs.path.join(allocator, &.{ dir, filename });
     defer allocator.free(path);
 
     // Only write if file doesn't exist
@@ -2107,6 +2134,24 @@ fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []con
     try file.writeAll(content);
 }
 
+/// Write-if-missing with optional BootstrapProvider routing.
+/// When a provider is set, stores the content through the provider as well
+/// (the file write still happens so file-based backends stay consistent).
+fn storeOrWriteIfMissing(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    filename: []const u8,
+    content: []const u8,
+    bp: ?bootstrap_mod.BootstrapProvider,
+) !void {
+    if (bp) |provider| {
+        if (!provider.exists(filename)) {
+            try provider.store(filename, content);
+        }
+    }
+    try writeIfMissing(allocator, dir, filename, content);
+}
+
 fn ensureBootstrapLifecycle(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
@@ -2114,7 +2159,7 @@ fn ensureBootstrapLifecycle(
     user_template: []const u8,
     had_legacy_user_content: bool,
 ) !void {
-    const bootstrap_path = try std.fmt.allocPrint(allocator, "{s}/BOOTSTRAP.md", .{workspace_dir});
+    const bootstrap_path = try std.fs.path.join(allocator, &.{ workspace_dir, "BOOTSTRAP.md" });
     defer allocator.free(bootstrap_path);
 
     var state = try readWorkspaceOnboardingState(allocator, workspace_dir);
@@ -2165,9 +2210,9 @@ fn isLegacyOnboardingCompleted(
     user_template: []const u8,
     had_legacy_user_content: bool,
 ) !bool {
-    const identity_path = try std.fmt.allocPrint(allocator, "{s}/IDENTITY.md", .{workspace_dir});
+    const identity_path = try std.fs.path.join(allocator, &.{ workspace_dir, "IDENTITY.md" });
     defer allocator.free(identity_path);
-    const user_path = try std.fmt.allocPrint(allocator, "{s}/USER.md", .{workspace_dir});
+    const user_path = try std.fs.path.join(allocator, &.{ workspace_dir, "USER.md" });
     defer allocator.free(user_path);
 
     var templates_diverged = false;
@@ -2187,11 +2232,7 @@ fn isLegacyOnboardingCompleted(
 }
 
 fn workspaceStatePath(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}/{s}/{s}",
-        .{ workspace_dir, WORKSPACE_STATE_DIR, WORKSPACE_STATE_FILE },
-    );
+    return std.fs.path.join(allocator, &.{ workspace_dir, WORKSPACE_STATE_DIR, WORKSPACE_STATE_FILE });
 }
 
 fn readWorkspaceOnboardingState(
@@ -2326,11 +2367,11 @@ fn pathExistsAbsolute(path: []const u8) bool {
 }
 
 fn hasLegacyUserContentIndicators(allocator: std.mem.Allocator, workspace_dir: []const u8) !bool {
-    const memory_dir_path = try std.fmt.allocPrint(allocator, "{s}/memory", .{workspace_dir});
+    const memory_dir_path = try std.fs.path.join(allocator, &.{ workspace_dir, "memory" });
     defer allocator.free(memory_dir_path);
-    const memory_file_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{workspace_dir});
+    const memory_file_path = try std.fs.path.join(allocator, &.{ workspace_dir, "MEMORY.md" });
     defer allocator.free(memory_file_path);
-    const git_dir_path = try std.fmt.allocPrint(allocator, "{s}/.git", .{workspace_dir});
+    const git_dir_path = try std.fs.path.join(allocator, &.{ workspace_dir, ".git" });
     defer allocator.free(git_dir_path);
 
     return pathExistsAbsolute(memory_dir_path) or
@@ -2419,7 +2460,7 @@ pub fn selectableBackends() []const memory_root.BackendDescriptor {
 
 /// Get the default memory backend key.
 pub fn defaultBackendKey() []const u8 {
-    return "markdown";
+    return "hybrid";
 }
 
 // ── Path helpers ─────────────────────────────────────────────────
@@ -2443,6 +2484,8 @@ test "canonicalProviderName handles aliases" {
     try std.testing.expectEqualStrings("together-ai", canonicalProviderName("together"));
     try std.testing.expectEqualStrings("gemini", canonicalProviderName("google"));
     try std.testing.expectEqualStrings("gemini", canonicalProviderName("google-gemini"));
+    try std.testing.expectEqualStrings("vertex", canonicalProviderName("vertex-ai"));
+    try std.testing.expectEqualStrings("vertex", canonicalProviderName("google-vertex"));
     try std.testing.expectEqualStrings("claude-cli", canonicalProviderName("claude-code"));
     try std.testing.expectEqualStrings("openai", canonicalProviderName("openai"));
 }
@@ -2488,22 +2531,24 @@ test "selectableBackends returns enabled backends" {
         try std.testing.expect(memory_root.findBackend(desc.name) != null);
     }
 
-    if (memory_root.findBackend("markdown") != null) {
+    if (memory_root.findBackend("hybrid") != null) {
+        try std.testing.expectEqualStrings("hybrid", backends[0].name);
+    } else if (memory_root.findBackend("markdown") != null) {
         try std.testing.expectEqualStrings("markdown", backends[0].name);
     } else if (memory_root.findBackend("none") != null) {
         try std.testing.expectEqualStrings("none", backends[0].name);
     }
 }
 
-test "selectableBackendsForWizard prioritizes sqlite and keeps api last" {
+test "selectableBackendsForWizard prioritizes hybrid and keeps api last" {
     const backends = try selectableBackendsForWizard(std.testing.allocator);
     defer std.testing.allocator.free(backends);
 
-    if (memory_root.findBackend("sqlite") != null) {
-        try std.testing.expectEqualStrings("sqlite", backends[0].name);
+    if (memory_root.findBackend("hybrid") != null) {
+        try std.testing.expectEqualStrings("hybrid", backends[0].name);
     }
-    if (memory_root.findBackend("sqlite") != null and memory_root.findBackend("markdown") != null and backends.len >= 2) {
-        try std.testing.expectEqualStrings("markdown", backends[1].name);
+    if (memory_root.findBackend("hybrid") != null and memory_root.findBackend("sqlite") != null and backends.len >= 2) {
+        try std.testing.expectEqualStrings("sqlite", backends[1].name);
     }
     if (memory_root.findBackend("api") != null) {
         try std.testing.expectEqualStrings("api", backends[backends.len - 1].name);
@@ -2511,6 +2556,7 @@ test "selectableBackendsForWizard prioritizes sqlite and keeps api last" {
 }
 
 test "memoryProfileForBackend maps common backends" {
+    try std.testing.expectEqualStrings("hybrid_keyword", memoryProfileForBackend("hybrid"));
     try std.testing.expectEqualStrings("local_keyword", memoryProfileForBackend("sqlite"));
     try std.testing.expectEqualStrings("markdown_only", memoryProfileForBackend("markdown"));
     try std.testing.expectEqualStrings("postgres_keyword", memoryProfileForBackend("postgres"));
@@ -2600,7 +2646,7 @@ test "scaffoldWorkspace creates core files and leaves MEMORY.md optional" {
     defer std.testing.allocator.free(base);
 
     const ctx = ProjectContext{};
-    try scaffoldWorkspace(std.testing.allocator, base, &ctx);
+    try scaffoldWorkspace(std.testing.allocator, base, &ctx, null);
 
     // Verify core files were created
     const agents = try tmp.dir.openFile("AGENTS.md", .{});
@@ -2621,9 +2667,9 @@ test "scaffoldWorkspace is idempotent" {
     defer std.testing.allocator.free(base);
 
     const ctx = ProjectContext{};
-    try scaffoldWorkspace(std.testing.allocator, base, &ctx);
+    try scaffoldWorkspace(std.testing.allocator, base, &ctx, null);
     // Running again should not fail
-    try scaffoldWorkspace(std.testing.allocator, base, &ctx);
+    try scaffoldWorkspace(std.testing.allocator, base, &ctx, null);
 }
 
 test "resetWorkspacePromptFiles overwrites prompt files with defaults" {
@@ -2644,7 +2690,7 @@ test "resetWorkspacePromptFiles overwrites prompt files with defaults" {
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    const report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{});
+    const report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{}, null);
     try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
     try std.testing.expectEqual(@as(usize, 0), report.removed_files);
 
@@ -2688,7 +2734,7 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
     const dry_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
         .clear_memory_markdown = true,
         .dry_run = true,
-    });
+    }, null);
     try std.testing.expectEqual(@as(usize, 6), dry_report.rewritten_files);
     try std.testing.expect(dry_report.removed_files >= 1);
     const memory_file = try tmp.dir.openFile("MEMORY.md", .{});
@@ -2696,7 +2742,7 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
 
     const reset_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
         .clear_memory_markdown = true,
-    });
+    }, null);
     try std.testing.expectEqual(@as(usize, 6), reset_report.rewritten_files);
     try std.testing.expect(reset_report.removed_files >= 1);
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("MEMORY.md", .{}));
@@ -2714,7 +2760,7 @@ test "resetWorkspacePromptFiles creates missing workspace directory" {
     const nested = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested/workspace", .{base});
     defer std.testing.allocator.free(nested);
 
-    const report = try resetWorkspacePromptFiles(std.testing.allocator, nested, &ProjectContext{}, .{});
+    const report = try resetWorkspacePromptFiles(std.testing.allocator, nested, &ProjectContext{}, .{}, null);
     try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
 
     const agents_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/AGENTS.md", .{nested});
@@ -2730,7 +2776,7 @@ test "scaffoldWorkspace seeds bootstrap marker for new workspace" {
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     const bootstrap_file = try tmp.dir.openFile("BOOTSTRAP.md", .{});
     bootstrap_file.close();
@@ -2748,7 +2794,7 @@ test "scaffoldWorkspace does not recreate BOOTSTRAP after onboarding completion"
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     {
         const f = try tmp.dir.createFile("IDENTITY.md", .{ .truncate = true });
@@ -2764,7 +2810,7 @@ test "scaffoldWorkspace does not recreate BOOTSTRAP after onboarding completion"
     try tmp.dir.deleteFile("BOOTSTRAP.md");
     try tmp.dir.deleteFile("TOOLS.md");
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
     const tools_file = try tmp.dir.openFile("TOOLS.md", .{});
@@ -2793,7 +2839,7 @@ test "scaffoldWorkspace does not seed BOOTSTRAP for legacy completed workspace" 
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
 
@@ -2820,7 +2866,7 @@ test "scaffoldWorkspace treats memory-backed workspace as existing and skips BOO
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     const identity_file = try tmp.dir.openFile("IDENTITY.md", .{});
     identity_file.close();
@@ -2850,7 +2896,7 @@ test "scaffoldWorkspace treats git-backed workspace as existing and skips BOOTST
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     const identity_file = try tmp.dir.openFile("IDENTITY.md", .{});
     identity_file.close();
@@ -2861,11 +2907,34 @@ test "scaffoldWorkspace treats git-backed workspace as existing and skips BOOTST
     try std.testing.expect(state.onboarding_completed_at != null);
 }
 
+test "scaffoldWorkspace handles trailing native separator on Windows paths" {
+    if (builtin.os.tag != .windows) return;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const workspace_with_sep = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}{s}",
+        .{ base, std.fs.path.sep_str },
+    );
+    defer std.testing.allocator.free(workspace_with_sep);
+
+    try scaffoldWorkspace(std.testing.allocator, workspace_with_sep, &ProjectContext{}, null);
+
+    const bootstrap_file = try tmp.dir.openFile("BOOTSTRAP.md", .{});
+    bootstrap_file.close();
+}
+
 // ── Additional onboard tests ────────────────────────────────────
 
 test "canonicalProviderName passthrough for known providers" {
     try std.testing.expectEqualStrings("anthropic", canonicalProviderName("anthropic"));
     try std.testing.expectEqualStrings("openrouter", canonicalProviderName("openrouter"));
+    try std.testing.expectEqualStrings("vertex", canonicalProviderName("vertex"));
     try std.testing.expectEqualStrings("deepseek", canonicalProviderName("deepseek"));
     try std.testing.expectEqualStrings("groq", canonicalProviderName("groq"));
     try std.testing.expectEqualStrings("ollama", canonicalProviderName("ollama"));
@@ -2946,6 +3015,12 @@ test "defaultModelForProvider gemini via alias" {
     try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("gemini"));
 }
 
+test "defaultModelForProvider vertex aliases" {
+    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("vertex"));
+    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("vertex-ai"));
+    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("google-vertex"));
+}
+
 test "defaultModelForProvider groq" {
     try std.testing.expectEqualStrings("llama-3.3-70b-versatile", defaultModelForProvider("groq"));
 }
@@ -2958,6 +3033,12 @@ test "providerEnvVar gemini aliases" {
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("gemini"));
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google"));
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google-gemini"));
+}
+
+test "providerEnvVar vertex aliases" {
+    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("vertex"));
+    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("vertex-ai"));
+    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("google-vertex"));
 }
 
 test "providerEnvVar deepseek" {
@@ -3021,7 +3102,7 @@ test "scaffoldWorkspace does not create memory subdirectory by default" {
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
     try std.testing.expectError(error.FileNotFound, tmp.dir.openDir("memory", .{}));
 }
 
@@ -3136,6 +3217,9 @@ test "agentsTemplate contains guidelines" {
     const tmpl = agentsTemplate();
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "AGENTS.md - Your Workspace") != null);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "Every Session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "memory.backend") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "memory_list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "memory_recall") != null);
 }
 
 test "toolsTemplate contains tool docs" {
@@ -3176,7 +3260,7 @@ test "scaffoldWorkspace creates core prompt.zig files" {
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     // Verify core files that prompt.zig always loads exist.
     const files = [_][]const u8{
@@ -3212,6 +3296,8 @@ test "fallbackModelsForProvider returns models for known providers" {
 
     const gemini_models = fallbackModelsForProvider("gemini");
     try std.testing.expect(gemini_models.len >= 2);
+    const vertex_models = fallbackModelsForProvider("vertex");
+    try std.testing.expect(vertex_models.len >= 2);
 
     const claude_cli_models = fallbackModelsForProvider("claude-cli");
     try std.testing.expect(claude_cli_models.len >= 1);
@@ -3226,6 +3312,10 @@ test "fallbackModelsForProvider handles aliases" {
     const models = fallbackModelsForProvider("google");
     try std.testing.expect(models.len >= 2);
     try std.testing.expectEqualStrings("gemini-2.5-pro", models[0]);
+
+    const vertex_models = fallbackModelsForProvider("vertex-ai");
+    try std.testing.expect(vertex_models.len >= 2);
+    try std.testing.expectEqualStrings("gemini-2.5-pro", vertex_models[0]);
 }
 
 test "fallbackModelsForProvider unknown returns anthropic fallback" {

@@ -44,7 +44,10 @@ pub const CronRunsTool = struct {
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
 
-        const runs = scheduler.listRuns(job_id, limit);
+        const runs = scheduler.listRuns(allocator, job_id, limit) catch {
+            return ToolResult.fail("Failed to load run history");
+        };
+        defer allocator.free(runs);
 
         if (runs.len == 0) {
             const msg = try std.fmt.allocPrint(allocator, "No run history for job {s}. Use 'cron run {s}' to execute manually.", .{ job_id, job_id });
@@ -117,7 +120,8 @@ test "cron_runs_no_history" {
     const job_id = job.id;
 
     // Verify no runs exist
-    const runs = scheduler.listRuns(job_id, 10);
+    const runs = try scheduler.listRuns(allocator, job_id, 10);
+    defer allocator.free(runs);
     try std.testing.expectEqual(@as(usize, 0), runs.len);
 
     // Also verify via tool with a nonexistent job (since tool loads from disk)
@@ -143,7 +147,8 @@ test "cron_runs_shows_history" {
     try scheduler.addRun(allocator, job_id, 2000, 2002, "error", null, 10);
 
     // Verify runs are stored
-    const runs = scheduler.listRuns(job_id, 10);
+    const runs = try scheduler.listRuns(allocator, job_id, 10);
+    defer allocator.free(runs);
     try std.testing.expectEqual(@as(usize, 2), runs.len);
     try std.testing.expectEqualStrings("success", runs[0].status);
     try std.testing.expectEqualStrings("error", runs[1].status);

@@ -83,6 +83,28 @@ pub const OAuthToken = struct {
 const CRED_DIR = ".nullclaw";
 const CRED_FILE = "auth.json";
 
+fn writeCredentialsFileAtomic(allocator: std.mem.Allocator, file_path: []const u8, contents: []const u8) !void {
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{file_path});
+    defer allocator.free(tmp_path);
+
+    const tmp_file = std.fs.createFileAbsolute(tmp_path, .{}) catch return error.CredentialWriteFailed;
+    tmp_file.writeAll(contents) catch {
+        tmp_file.close();
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        return error.CredentialWriteFailed;
+    };
+
+    if (@import("builtin").os.tag != .windows) {
+        tmp_file.chmod(0o600) catch {};
+    }
+    tmp_file.close();
+
+    std.fs.renameAbsolute(tmp_path, file_path) catch {
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        return error.CredentialWriteFailed;
+    };
+}
+
 /// Save a credential for the given provider to ~/.nullclaw/auth.json.
 /// Merges with existing credentials (other providers are preserved).
 /// File permissions are set to 0o600.
@@ -164,14 +186,7 @@ pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token:
     }
     try buf.append(allocator, '}');
 
-    // Write atomically
-    const file = std.fs.cwd().createFile(file_path, .{}) catch return error.CredentialWriteFailed;
-    defer file.close();
-    file.writeAll(buf.items) catch return error.CredentialWriteFailed;
-
-    if (@import("builtin").os.tag != .windows) {
-        file.chmod(0o600) catch {};
-    }
+    try writeCredentialsFileAtomic(allocator, file_path, buf.items);
 }
 
 /// Load a credential for the given provider from ~/.nullclaw/auth.json.
@@ -307,18 +322,27 @@ fn loadAllCredentials(allocator: std.mem.Allocator, file_path: []const u8) ?std.
         } else "Bearer";
 
         const key = allocator.dupe(u8, entry.key_ptr.*) catch continue;
+        const access_token = allocator.dupe(u8, at) catch {
+            allocator.free(key);
+            continue;
+        };
+        const refresh_token = if (rt) |r| allocator.dupe(u8, r) catch null else null;
+        const token_type = allocator.dupe(u8, tt) catch {
+            allocator.free(key);
+            allocator.free(access_token);
+            if (refresh_token) |owned_rt| allocator.free(owned_rt);
+            continue;
+        };
+
         map.put(key, .{
-            .access_token = allocator.dupe(u8, at) catch {
-                allocator.free(key);
-                continue;
-            },
-            .refresh_token = if (rt) |r| allocator.dupe(u8, r) catch null else null,
+            .access_token = access_token,
+            .refresh_token = refresh_token,
             .expires_at = ea,
-            .token_type = allocator.dupe(u8, tt) catch {
-                allocator.free(key);
-                continue;
-            },
+            .token_type = token_type,
         }) catch {
+            allocator.free(token_type);
+            if (refresh_token) |owned_rt| allocator.free(owned_rt);
+            allocator.free(access_token);
             allocator.free(key);
             continue;
         };
@@ -434,9 +458,7 @@ pub fn deleteCredential(allocator: std.mem.Allocator, provider: []const u8) !boo
     }
     try buf.append(allocator, '}');
 
-    const file = std.fs.cwd().createFile(file_path, .{}) catch return error.CredentialWriteFailed;
-    defer file.close();
-    file.writeAll(buf.items) catch return error.CredentialWriteFailed;
+    try writeCredentialsFileAtomic(allocator, file_path, buf.items);
 
     return true;
 }
