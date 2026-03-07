@@ -30,6 +30,8 @@ pub const Action = audit.Action;
 pub const ExecutionResult = audit.ExecutionResult;
 pub const SecurityContext = audit.SecurityContext;
 pub const CommandExecutionLog = audit.CommandExecutionLog;
+pub const ToolCallContext = audit.ToolCallContext;
+pub const ToolCallLog = audit.ToolCallLog;
 
 pub const AutonomyLevel = policy.AutonomyLevel;
 pub const CommandRiskLevel = policy.CommandRiskLevel;

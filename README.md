@@ -400,10 +400,21 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
   "security": {
     "sandbox": { "backend": "auto" },
     "resources": { "max_memory_mb": 512, "max_cpu_percent": 80 },
-    "audit": { "enabled": true, "retention_days": 90 }
+    "audit": {
+      "enabled": true,
+      "retention_days": 90,
+      "capture_shell_output": false,
+      "max_output_bytes": 2048
+    }
   }
 }
 ```
+
+Audit output capture is opt-in:
+- `security.audit.capture_shell_output`: `false` by default (secure-by-default).
+- `security.audit.max_output_bytes`: truncation limit per stdout/stderr field when capture is enabled.
+- Captured output is sanitized and may be redacted if potential secret material is detected.
+- Compatibility note: `event_id` is monotonic within a process session (it may reset after restart). Use `event_uid` (or `session_id` + `event_id`) as the globally unique identifier across sessions.
 
 ### Full Web Search + Shell Access
 

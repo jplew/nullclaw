@@ -25,9 +25,11 @@ const subagent_runner = @import("subagent_runner.zig");
 const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
 const security = @import("security/policy.zig");
+const security_audit = @import("security/audit.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
+const log = std.log.scoped(.gateway);
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -2465,6 +2467,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var subagent_manager_opt: ?*subagent_mod.SubagentManager = null;
     var sec_tracker_opt: ?security.RateTracker = null;
     var sec_policy_opt: ?security.SecurityPolicy = null;
+    var audit_logger_opt: ?security_audit.AuditLogger = null;
     var gateway_thread_observer = GatewayThreadObserver.init(allocator);
     defer gateway_thread_observer.deinit();
     const needs_local_agent = event_bus == null;
@@ -2537,6 +2540,19 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 const provider_i: providers.Provider = bundle.provider();
                 const resolved_api_key = bundle.primaryApiKey();
 
+                if (cfg.security.audit.enabled) {
+                    audit_logger_opt = security_audit.AuditLogger.init(allocator, .{
+                        .enabled = cfg.security.audit.enabled,
+                        .log_path = cfg.security.audit.log_path,
+                        .max_size_mb = cfg.security.audit.max_size_mb,
+                        .capture_shell_output = cfg.security.audit.capture_shell_output,
+                        .max_output_bytes = cfg.security.audit.max_output_bytes,
+                    }, cfg.workspace_dir) catch |err| blk: {
+                        log.warn("audit logger init failed: {}", .{err});
+                        break :blk null;
+                    };
+                }
+
                 // Optional memory backend.
                 mem_rt = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
 
@@ -2562,6 +2578,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .fallback_api_key = resolved_api_key,
                     .allowed_paths = cfg.autonomy.allowed_paths,
                     .policy = if (sec_policy_opt) |*policy| policy else null,
+                    .audit_logger = if (audit_logger_opt) |*logger| logger else null,
+                    .audit_channel = "runtime",
+                    .audit_capture_shell_output = cfg.security.audit.capture_shell_output,
+                    .audit_max_output_bytes = @intCast(cfg.security.audit.max_output_bytes),
                     .subagent_manager = subagent_manager_opt,
                 }) catch &.{};
 
@@ -2570,6 +2590,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 if (sec_policy_opt) |*policy| {
                     sm.policy = policy;
                 }
+                sm.audit_logger = if (audit_logger_opt) |*logger| logger else null;
+                sm.audit_channel = "runtime";
                 if (mem_rt) |*rt| {
                     sm.mem_rt = rt;
                     tools_mod.bindMemoryRuntime(tools_slice, rt);
@@ -2592,6 +2614,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     };
     defer if (tools_slice.len > 0) tools_mod.deinitTools(allocator, tools_slice);
     defer if (session_mgr_opt) |*sm| sm.deinit();
+    defer if (audit_logger_opt) |*logger| logger.deinit();
     defer if (sec_tracker_opt) |*tracker| tracker.deinit();
 
     // Resolve the listen address

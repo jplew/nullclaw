@@ -20,6 +20,7 @@ const subagent_mod = @import("../subagent.zig");
 const subagent_runner = @import("../subagent_runner.zig");
 const cli_mod = @import("../channels/cli.zig");
 const security = @import("../security/policy.zig");
+const security_audit = @import("../security/audit.zig");
 const auth_mod = @import("../auth.zig");
 const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
@@ -210,6 +211,21 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .tracker = &tracker,
     };
 
+    var audit_logger_opt: ?security_audit.AuditLogger = null;
+    if (cfg.security.audit.enabled) {
+        audit_logger_opt = security_audit.AuditLogger.init(allocator, .{
+            .enabled = cfg.security.audit.enabled,
+            .log_path = cfg.security.audit.log_path,
+            .max_size_mb = cfg.security.audit.max_size_mb,
+            .capture_shell_output = cfg.security.audit.capture_shell_output,
+            .max_output_bytes = cfg.security.audit.max_output_bytes,
+        }, cfg.workspace_dir) catch |err| blk: {
+            log.warn("audit logger init failed: {}", .{err});
+            break :blk null;
+        };
+    }
+    defer if (audit_logger_opt) |*logger| logger.deinit();
+
     // Provider runtime bundle (primary provider + reliability wrapper).
     var runtime_provider = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &cfg);
     defer runtime_provider.deinit();
@@ -235,6 +251,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .tools_config = cfg.tools,
         .allowed_paths = cfg.autonomy.allowed_paths,
         .policy = &policy,
+        .audit_logger = if (audit_logger_opt) |*logger| logger else null,
+        .audit_channel = "cli",
+        .audit_capture_shell_output = cfg.security.audit.capture_shell_output,
+        .audit_max_output_bytes = @intCast(cfg.security.audit.max_output_bytes),
         .subagent_manager = &subagent_manager,
     });
     defer tools_mod.deinitTools(allocator, tools);
@@ -267,6 +287,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
         var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
         agent.policy = &policy;
+        agent.audit_logger = if (audit_logger_opt) |*logger| logger else null;
+        agent.audit_channel = "cli";
         agent.session_store = if (mem_rt) |rt| rt.session_store else null;
         agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
         agent.mem_rt = if (mem_rt) |*rt| rt else null;
@@ -361,6 +383,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
     agent.policy = &policy;
+    agent.audit_logger = if (audit_logger_opt) |*logger| logger else null;
+    agent.audit_channel = "cli";
     agent.session_store = if (mem_rt) |rt| rt.session_store else null;
     agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
     agent.mem_rt = if (mem_rt) |*rt| rt else null;
