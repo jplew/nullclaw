@@ -58,6 +58,8 @@ pub const ExecutionResult = struct {
     stderr: ?[]const u8 = null,
     stdout_truncated: bool = false,
     stderr_truncated: bool = false,
+    output_preview: ?[]const u8 = null,
+    output_preview_truncated: bool = false,
 };
 
 /// Security context
@@ -174,6 +176,17 @@ pub const AuditEvent = struct {
         return ev;
     }
 
+    /// Attach optional captured tool output preview.
+    pub fn withOutputPreview(self: AuditEvent, output_preview: ?[]const u8, output_preview_truncated: bool) AuditEvent {
+        var ev = self;
+        if (ev.result == null) {
+            ev.result = .{ .success = false };
+        }
+        ev.result.?.output_preview = output_preview;
+        ev.result.?.output_preview_truncated = output_preview_truncated;
+        return ev;
+    }
+
     /// Set security context sandbox backend
     pub fn withSecurity(self: AuditEvent, sandbox_backend: ?[]const u8) AuditEvent {
         var ev = self;
@@ -258,6 +271,11 @@ pub const AuditEvent = struct {
                 try writeJsonString(writer, err_out);
                 try writer.print(",\"stderr_truncated\":{}", .{res.stderr_truncated});
             }
+            if (res.output_preview) |preview| {
+                try writer.writeAll(",\"output_preview\":");
+                try writeJsonString(writer, preview);
+                try writer.print(",\"output_preview_truncated\":{}", .{res.output_preview_truncated});
+            }
             try writer.writeAll("}");
         }
 
@@ -293,6 +311,8 @@ pub const ToolCallLog = struct {
     tool_call_id: ?[]const u8 = null,
     success: bool,
     duration_ms: u64,
+    output_preview: ?[]const u8 = null,
+    output_preview_truncated: bool = false,
 };
 
 /// Audit logger configuration
@@ -302,6 +322,8 @@ pub const AuditConfig = struct {
     max_size_mb: u32 = 10,
     capture_shell_output: bool = false,
     max_output_bytes: u32 = 2048,
+    capture_tool_output: bool = false,
+    max_tool_output_bytes: u32 = 512,
 };
 
 /// Audit logger — writes JSON audit events to a log file.
@@ -358,7 +380,8 @@ pub const AuditLogger = struct {
         var event = AuditEvent.init(.tool_call)
             .withActor(entry.channel, null, null)
             .withToolCall(entry.name, entry.tool_call_id)
-            .withResult(entry.success, null, entry.duration_ms, null);
+            .withResult(entry.success, null, entry.duration_ms, null)
+            .withOutputPreview(entry.output_preview, entry.output_preview_truncated);
         try self.log(&event);
     }
 
@@ -536,13 +559,15 @@ test "audit event with tool call context" {
     const event = AuditEvent.init(.tool_call)
         .withActor("runtime", null, null)
         .withToolCall("memory_store", "tool-123")
-        .withResult(true, null, 11, null);
+        .withResult(true, null, 11, null)
+        .withOutputPreview("stored preference key=theme", false);
 
     var buf: [2048]u8 = undefined;
     var ev = event;
     const json = try ev.writeJson(&buf);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"event_type\":\"tool_call\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_call\":{\"name\":\"memory_store\",\"tool_call_id\":\"tool-123\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"output_preview\":\"stored preference key=theme\"") != null);
 }
 
 test "audit event with result error message" {
@@ -608,6 +633,8 @@ test "audit config defaults" {
     try std.testing.expectEqual(@as(u32, 10), cfg.max_size_mb);
     try std.testing.expect(!cfg.capture_shell_output);
     try std.testing.expectEqual(@as(u32, 2048), cfg.max_output_bytes);
+    try std.testing.expect(!cfg.capture_tool_output);
+    try std.testing.expectEqual(@as(u32, 512), cfg.max_tool_output_bytes);
 }
 
 test "audit config custom" {
@@ -617,12 +644,16 @@ test "audit config custom" {
         .max_size_mb = 50,
         .capture_shell_output = true,
         .max_output_bytes = 1024,
+        .capture_tool_output = true,
+        .max_tool_output_bytes = 256,
     };
     try std.testing.expect(!cfg.enabled);
     try std.testing.expectEqualStrings("custom.log", cfg.log_path);
     try std.testing.expectEqual(@as(u32, 50), cfg.max_size_mb);
     try std.testing.expect(cfg.capture_shell_output);
     try std.testing.expectEqual(@as(u32, 1024), cfg.max_output_bytes);
+    try std.testing.expect(cfg.capture_tool_output);
+    try std.testing.expectEqual(@as(u32, 256), cfg.max_tool_output_bytes);
 }
 
 test "audit logger enabled writes to file" {
@@ -713,6 +744,8 @@ test "audit tool call log" {
         .tool_call_id = "call-42",
         .success = true,
         .duration_ms = 33,
+        .output_preview = "Top results: zig 0.15 release notes...",
+        .output_preview_truncated = true,
     });
 
     const content = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "tool_audit.log", 4096);
@@ -720,6 +753,8 @@ test "audit tool call log" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"event_type\":\"tool_call\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"name\":\"web_search\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"tool_call_id\":\"call-42\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"output_preview\":\"Top results: zig 0.15 release notes...\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"output_preview_truncated\":true") != null);
 }
 
 test "audit event ids are sequential" {

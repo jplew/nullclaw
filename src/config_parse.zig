@@ -1624,6 +1624,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (aud.object.get("max_output_bytes")) |v| {
                         if (v == .integer) self.security.audit.max_output_bytes = @intCast(v.integer);
                     }
+                    if (aud.object.get("capture_tool_output")) |v| {
+                        if (v == .bool) self.security.audit.capture_tool_output = v.bool;
+                    }
+                    if (aud.object.get("max_tool_output_bytes")) |v| {
+                        if (v == .integer) self.security.audit.max_tool_output_bytes = @intCast(v.integer);
+                    }
                 }
             }
         }

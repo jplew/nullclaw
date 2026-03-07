@@ -783,6 +783,8 @@ pub const Config = struct {
                 .sign_events = self.security.audit.sign_events,
                 .capture_shell_output = self.security.audit.capture_shell_output,
                 .max_output_bytes = self.security.audit.max_output_bytes,
+                .capture_tool_output = self.security.audit.capture_tool_output,
+                .max_tool_output_bytes = self.security.audit.max_tool_output_bytes,
             },
         }, .{})});
         try w.print("  \"peripherals\": {f},\n", .{std.json.fmt(.{
@@ -1622,6 +1624,8 @@ test "save roundtrip preserves extended config sections" {
     cfg.security.audit.sign_events = true;
     cfg.security.audit.capture_shell_output = true;
     cfg.security.audit.max_output_bytes = 1024;
+    cfg.security.audit.capture_tool_output = true;
+    cfg.security.audit.max_tool_output_bytes = 384;
 
     cfg.peripherals.enabled = true;
     cfg.peripherals.datasheet_dir = "/tmp/ds";
@@ -1698,6 +1702,8 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqual(config_types.SandboxBackend.firejail, loaded.security.sandbox.backend);
     try std.testing.expect(loaded.security.audit.capture_shell_output);
     try std.testing.expectEqual(@as(u32, 1024), loaded.security.audit.max_output_bytes);
+    try std.testing.expect(loaded.security.audit.capture_tool_output);
+    try std.testing.expectEqual(@as(u32, 384), loaded.security.audit.max_tool_output_bytes);
     try std.testing.expect(loaded.peripherals.enabled);
     try std.testing.expectEqualStrings("/dev/tty.usbmodem1", loaded.hardware.serial_port.?);
     try std.testing.expectEqual(config_types.DmScope.per_peer, loaded.session.dm_scope);
@@ -2398,6 +2404,8 @@ test "json parse security section" {
     try std.testing.expectEqualStrings("custom.log", cfg.security.audit.log_path);
     try std.testing.expect(!cfg.security.audit.capture_shell_output);
     try std.testing.expectEqual(@as(u32, 2048), cfg.security.audit.max_output_bytes);
+    try std.testing.expect(!cfg.security.audit.capture_tool_output);
+    try std.testing.expectEqual(@as(u32, 512), cfg.security.audit.max_tool_output_bytes);
     allocator.free(cfg.security.audit.log_path);
 }
 

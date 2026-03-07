@@ -295,6 +295,10 @@ pub const Agent = struct {
     audit_logger: ?*const security_audit.AuditLogger = null,
     /// Logical actor channel written into audit events.
     audit_channel: []const u8 = "runtime",
+    /// Whether to capture a preview of generic tool output in audit logs.
+    audit_capture_tool_output: bool = false,
+    /// Maximum bytes to retain in tool output previews.
+    audit_max_tool_output_bytes: usize = 512,
 
     /// Optional streaming callback. When set, turn() uses streamChat() for streaming providers.
     stream_callback: ?providers.StreamCallback = null,
@@ -397,6 +401,8 @@ pub const Agent = struct {
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
+            .audit_capture_tool_output = cfg.security.audit.capture_tool_output,
+            .audit_max_tool_output_bytes = cfg.security.audit.max_tool_output_bytes,
             .exec_security = switch (cfg.autonomy.level) {
                 .full => .full,
                 .read_only => .deny,
@@ -1220,7 +1226,7 @@ pub const Agent = struct {
                         .{ session_hash, idx + 1, call.name, result.success, tool_duration },
                     );
                 }
-                self.logToolCallAudit(call, result.success, tool_duration);
+                self.logToolCallAudit(call, result.output, result.success, tool_duration);
 
                 const tool_event = ObserverEvent{ .tool_call = .{
                     .tool = call.name,
@@ -1494,15 +1500,39 @@ pub const Agent = struct {
         };
     }
 
-    fn logToolCallAudit(self: *Agent, call: ParsedToolCall, success: bool, duration_ms: u64) void {
+    fn logToolCallAudit(self: *Agent, call: ParsedToolCall, output: []const u8, success: bool, duration_ms: u64) void {
         const logger = self.audit_logger orelse return;
+        var output_preview: ?[]const u8 = null;
+        var output_preview_truncated = false;
+
+        if (self.audit_capture_tool_output and self.audit_max_tool_output_bytes > 0 and output.len > 0) {
+            const preview_len = @min(output.len, self.audit_max_tool_output_bytes);
+            const preview = output[0..preview_len];
+            output_preview_truncated = output.len > preview_len;
+            output_preview = if (containsSensitiveAuditContent(preview)) "[REDACTED_POTENTIAL_SECRET]" else preview;
+        }
+
         logger.logToolCall(.{
             .channel = self.audit_channel,
             .name = call.name,
             .tool_call_id = call.tool_call_id,
             .success = success,
             .duration_ms = duration_ms,
+            .output_preview = output_preview,
+            .output_preview_truncated = output_preview_truncated,
         }) catch {};
+    }
+
+    fn containsSensitiveAuditContent(text: []const u8) bool {
+        return std.mem.indexOf(u8, text, "BEGIN PRIVATE KEY") != null or
+            std.mem.indexOf(u8, text, "BEGIN RSA PRIVATE KEY") != null or
+            std.mem.indexOf(u8, text, "Authorization: Bearer ") != null or
+            std.mem.indexOf(u8, text, "AWS_SECRET_ACCESS_KEY") != null or
+            std.mem.indexOf(u8, text, "OPENAI_API_KEY") != null or
+            std.mem.indexOf(u8, text, "ANTHROPIC_API_KEY") != null or
+            std.mem.indexOf(u8, text, "sk-or-") != null or
+            std.mem.indexOf(u8, text, "sk-ant-") != null or
+            std.mem.indexOf(u8, text, "sk-proj-") != null;
     }
 
     const LLM_LOG_MAX_BYTES: usize = 8192;

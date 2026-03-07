@@ -1201,6 +1201,8 @@ pub const AuditConfig = struct {
     sign_events: bool = false,
     capture_shell_output: bool = false,
     max_output_bytes: u32 = 2048,
+    capture_tool_output: bool = false,
+    max_tool_output_bytes: u32 = 512,
 };
 
 pub const SecurityConfig = struct {
