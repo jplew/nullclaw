@@ -5,6 +5,7 @@ const audit_log = std.log.scoped(.audit);
 /// Audit event types
 pub const AuditEventType = enum {
     command_execution,
+    tool_call,
     file_access,
     config_change,
     auth_success,
@@ -15,6 +16,7 @@ pub const AuditEventType = enum {
     pub fn toString(self: AuditEventType) []const u8 {
         return switch (self) {
             .command_execution => "command_execution",
+            .tool_call => "tool_call",
             .file_access => "file_access",
             .config_change => "config_change",
             .auth_success => "auth_success",
@@ -36,8 +38,14 @@ pub const Actor = struct {
 pub const Action = struct {
     command: ?[]const u8 = null,
     risk_level: ?[]const u8 = null,
+    tool_call_id: ?[]const u8 = null,
     approved: bool,
     allowed: bool,
+};
+
+pub const ToolCallContext = struct {
+    name: []const u8,
+    tool_call_id: ?[]const u8 = null,
 };
 
 /// Execution result
@@ -46,6 +54,12 @@ pub const ExecutionResult = struct {
     exit_code: ?i32 = null,
     duration_ms: ?u64 = null,
     err_msg: ?[]const u8 = null,
+    stdout: ?[]const u8 = null,
+    stderr: ?[]const u8 = null,
+    stdout_truncated: bool = false,
+    stderr_truncated: bool = false,
+    output_preview: ?[]const u8 = null,
+    output_preview_truncated: bool = false,
 };
 
 /// Security context
@@ -59,25 +73,44 @@ pub const SecurityContext = struct {
 pub const AuditEvent = struct {
     /// Timestamp in seconds since epoch (UTC)
     timestamp_s: i64,
-    /// Unique event identifier (counter-based for simplicity)
+    /// Per-process session identifier (stable for process lifetime).
+    session_id: u64,
+    /// Monotonic event identifier scoped to session_id.
     event_id: u64,
     event_type: AuditEventType,
     actor: ?Actor = null,
     action: ?Action = null,
+    tool_call: ?ToolCallContext = null,
     result: ?ExecutionResult = null,
     security: SecurityContext = .{},
 
-    /// Global counter for unique event IDs
+    /// Global counter for session-scoped event IDs.
     var next_id: u64 = 0;
+    /// Lazy-initialized process session identifier.
+    var process_session_id: u64 = 0;
 
-    /// Create a new audit event with current timestamp and unique ID
+    /// Create a new audit event with current timestamp and unique IDs.
     pub fn init(event_type: AuditEventType) AuditEvent {
         const id = @atomicRmw(u64, &next_id, .Add, 1, .monotonic);
         return .{
             .timestamp_s = std.time.timestamp(),
+            .session_id = getSessionId(),
             .event_id = id,
             .event_type = event_type,
         };
+    }
+
+    fn getSessionId() u64 {
+        const existing = @atomicLoad(u64, &process_session_id, .monotonic);
+        if (existing != 0) return existing;
+
+        var generated = std.crypto.random.int(u64);
+        if (generated == 0) generated = 1;
+
+        if (@cmpxchgStrong(u64, &process_session_id, 0, generated, .seq_cst, .seq_cst)) |race_value| {
+            return race_value;
+        }
+        return generated;
     }
 
     /// Set the actor
@@ -103,6 +136,15 @@ pub const AuditEvent = struct {
         return ev;
     }
 
+    pub fn withToolCall(self: AuditEvent, name: []const u8, tool_call_id: ?[]const u8) AuditEvent {
+        var ev = self;
+        ev.tool_call = .{
+            .name = name,
+            .tool_call_id = tool_call_id,
+        };
+        return ev;
+    }
+
     /// Set the result
     pub fn withResult(self: AuditEvent, success: bool, exit_code: ?i32, duration_ms: u64, err_msg: ?[]const u8) AuditEvent {
         var ev = self;
@@ -112,6 +154,36 @@ pub const AuditEvent = struct {
             .duration_ms = duration_ms,
             .err_msg = err_msg,
         };
+        return ev;
+    }
+
+    /// Attach optional captured command output.
+    pub fn withOutput(
+        self: AuditEvent,
+        stdout: ?[]const u8,
+        stderr: ?[]const u8,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+    ) AuditEvent {
+        var ev = self;
+        if (ev.result == null) {
+            ev.result = .{ .success = false };
+        }
+        ev.result.?.stdout = stdout;
+        ev.result.?.stderr = stderr;
+        ev.result.?.stdout_truncated = stdout_truncated;
+        ev.result.?.stderr_truncated = stderr_truncated;
+        return ev;
+    }
+
+    /// Attach optional captured tool output preview.
+    pub fn withOutputPreview(self: AuditEvent, output_preview: ?[]const u8, output_preview_truncated: bool) AuditEvent {
+        var ev = self;
+        if (ev.result == null) {
+            ev.result = .{ .success = false };
+        }
+        ev.result.?.output_preview = output_preview;
+        ev.result.?.output_preview_truncated = output_preview_truncated;
         return ev;
     }
 
@@ -128,14 +200,21 @@ pub const AuditEvent = struct {
         var fbs = std.io.fixedBufferStream(buf);
         const writer = fbs.writer();
         try writer.print(
-            "{{\"timestamp_s\":{d},\"event_id\":{d},\"event_type\":\"{s}\"",
-            .{ self.timestamp_s, self.event_id, self.event_type.toString() },
+            "{{\"timestamp_s\":{d},\"session_id\":\"{x:0>16}\",\"event_id\":{d},\"event_uid\":\"{x:0>16}-{x:0>16}\",\"event_type\":\"{s}\"",
+            .{ self.timestamp_s, self.session_id, self.event_id, self.session_id, self.event_id, self.event_type.toString() },
         );
 
         if (self.actor) |a| {
-            try writer.print(",\"actor\":{{\"channel\":\"{s}\"", .{a.channel});
-            if (a.user_id) |uid| try writer.print(",\"user_id\":\"{s}\"", .{uid});
-            if (a.username) |uname| try writer.print(",\"username\":\"{s}\"", .{uname});
+            try writer.writeAll(",\"actor\":{\"channel\":");
+            try writeJsonString(writer, a.channel);
+            if (a.user_id) |uid| {
+                try writer.writeAll(",\"user_id\":");
+                try writeJsonString(writer, uid);
+            }
+            if (a.username) |uname| {
+                try writer.writeAll(",\"username\":");
+                try writeJsonString(writer, uname);
+            }
             try writer.writeAll("}");
         }
 
@@ -143,12 +222,20 @@ pub const AuditEvent = struct {
             try writer.writeAll(",\"action\":{");
             var need_comma = false;
             if (act.command) |cmd| {
-                try writer.print("\"command\":\"{s}\"", .{cmd});
+                try writer.writeAll("\"command\":");
+                try writeJsonString(writer, cmd);
                 need_comma = true;
             }
             if (act.risk_level) |rl| {
                 if (need_comma) try writer.writeAll(",");
-                try writer.print("\"risk_level\":\"{s}\"", .{rl});
+                try writer.writeAll("\"risk_level\":");
+                try writeJsonString(writer, rl);
+                need_comma = true;
+            }
+            if (act.tool_call_id) |tcid| {
+                if (need_comma) try writer.writeAll(",");
+                try writer.writeAll("\"tool_call_id\":");
+                try writeJsonString(writer, tcid);
                 need_comma = true;
             }
             if (need_comma) try writer.writeAll(",");
@@ -156,17 +243,48 @@ pub const AuditEvent = struct {
             try writer.writeAll("}");
         }
 
+        if (self.tool_call) |tc| {
+            try writer.writeAll(",\"tool_call\":{\"name\":");
+            try writeJsonString(writer, tc.name);
+            if (tc.tool_call_id) |tcid| {
+                try writer.writeAll(",\"tool_call_id\":");
+                try writeJsonString(writer, tcid);
+            }
+            try writer.writeAll("}");
+        }
+
         if (self.result) |res| {
             try writer.print(",\"result\":{{\"success\":{}", .{res.success});
             if (res.exit_code) |ec| try writer.print(",\"exit_code\":{d}", .{ec});
             if (res.duration_ms) |ms| try writer.print(",\"duration_ms\":{d}", .{ms});
-            if (res.err_msg) |em| try writer.print(",\"error\":\"{s}\"", .{em});
+            if (res.err_msg) |em| {
+                try writer.writeAll(",\"error\":");
+                try writeJsonString(writer, em);
+            }
+            if (res.stdout) |out| {
+                try writer.writeAll(",\"stdout\":");
+                try writeJsonString(writer, out);
+                try writer.print(",\"stdout_truncated\":{}", .{res.stdout_truncated});
+            }
+            if (res.stderr) |err_out| {
+                try writer.writeAll(",\"stderr\":");
+                try writeJsonString(writer, err_out);
+                try writer.print(",\"stderr_truncated\":{}", .{res.stderr_truncated});
+            }
+            if (res.output_preview) |preview| {
+                try writer.writeAll(",\"output_preview\":");
+                try writeJsonString(writer, preview);
+                try writer.print(",\"output_preview_truncated\":{}", .{res.output_preview_truncated});
+            }
             try writer.writeAll("}");
         }
 
         try writer.print(",\"security\":{{\"policy_violation\":{}", .{self.security.policy_violation});
         if (self.security.rate_limit_remaining) |rlr| try writer.print(",\"rate_limit_remaining\":{d}", .{rlr});
-        if (self.security.sandbox_backend) |sb| try writer.print(",\"sandbox_backend\":\"{s}\"", .{sb});
+        if (self.security.sandbox_backend) |sb| {
+            try writer.writeAll(",\"sandbox_backend\":");
+            try writeJsonString(writer, sb);
+        }
         try writer.writeAll("}}");
         return fbs.getWritten();
     }
@@ -181,6 +299,20 @@ pub const CommandExecutionLog = struct {
     allowed: bool,
     success: bool,
     duration_ms: u64,
+    stdout: ?[]const u8 = null,
+    stderr: ?[]const u8 = null,
+    stdout_truncated: bool = false,
+    stderr_truncated: bool = false,
+};
+
+pub const ToolCallLog = struct {
+    channel: []const u8,
+    name: []const u8,
+    tool_call_id: ?[]const u8 = null,
+    success: bool,
+    duration_ms: u64,
+    output_preview: ?[]const u8 = null,
+    output_preview_truncated: bool = false,
 };
 
 /// Audit logger configuration
@@ -188,6 +320,10 @@ pub const AuditConfig = struct {
     enabled: bool = true,
     log_path: []const u8 = "audit.log",
     max_size_mb: u32 = 10,
+    capture_shell_output: bool = false,
+    max_output_bytes: u32 = 2048,
+    capture_tool_output: bool = false,
+    max_tool_output_bytes: u32 = 512,
 };
 
 /// Audit logger — writes JSON audit events to a log file.
@@ -235,7 +371,17 @@ pub const AuditLogger = struct {
         var event = AuditEvent.init(.command_execution)
             .withActor(entry.channel, null, null)
             .withAction(entry.command, entry.risk_level, entry.approved, entry.allowed)
-            .withResult(entry.success, null, entry.duration_ms, null);
+            .withResult(entry.success, null, entry.duration_ms, null)
+            .withOutput(entry.stdout, entry.stderr, entry.stdout_truncated, entry.stderr_truncated);
+        try self.log(&event);
+    }
+
+    pub fn logToolCall(self: *const AuditLogger, entry: ToolCallLog) !void {
+        var event = AuditEvent.init(.tool_call)
+            .withActor(entry.channel, null, null)
+            .withToolCall(entry.name, entry.tool_call_id)
+            .withResult(entry.success, null, entry.duration_ms, null)
+            .withOutputPreview(entry.output_preview, entry.output_preview_truncated);
         try self.log(&event);
     }
 
@@ -274,11 +420,35 @@ pub const AuditLogger = struct {
     }
 };
 
+fn writeJsonString(writer: anytype, s: []const u8) !void {
+    try writer.writeByte('"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0C => try writer.writeAll("\\f"),
+            else => {
+                if (c < 0x20) {
+                    try writer.print("\\u00{x:0>2}", .{c});
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
+    try writer.writeByte('"');
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 test "audit event init creates unique ids" {
     const e1 = AuditEvent.init(.command_execution);
     const e2 = AuditEvent.init(.command_execution);
+    try std.testing.expectEqual(e1.session_id, e2.session_id);
     try std.testing.expect(e1.event_id != e2.event_id);
 }
 
@@ -313,10 +483,13 @@ test "audit event serializes to json" {
     try std.testing.expect(std.mem.indexOf(u8, json, "command_execution") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "telegram") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"session_id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"event_uid\":\"") != null);
 }
 
 test "audit event type toString" {
     try std.testing.expectEqualStrings("command_execution", AuditEventType.command_execution.toString());
+    try std.testing.expectEqualStrings("tool_call", AuditEventType.tool_call.toString());
     try std.testing.expectEqualStrings("policy_violation", AuditEventType.policy_violation.toString());
     try std.testing.expectEqualStrings("auth_success", AuditEventType.auth_success.toString());
 }
@@ -343,9 +516,8 @@ test "audit logger disabled does not create file" {
 
 test "audit event types all have string representations" {
     const types = [_]AuditEventType{
-        .command_execution, .file_access,  .config_change,
-        .auth_success,      .auth_failure, .policy_violation,
-        .security_event,
+        .command_execution, .tool_call,    .file_access,      .config_change,
+        .auth_success,      .auth_failure, .policy_violation, .security_event,
     };
     for (types) |t| {
         const s = t.toString();
@@ -362,6 +534,40 @@ test "audit event with result" {
     try std.testing.expectEqual(@as(?i32, 0), r.exit_code);
     try std.testing.expectEqual(@as(?u64, 42), r.duration_ms);
     try std.testing.expect(r.err_msg == null);
+    try std.testing.expect(r.stdout == null);
+    try std.testing.expect(r.stderr == null);
+}
+
+test "audit event with captured output" {
+    const event = AuditEvent.init(.command_execution)
+        .withResult(true, 0, 7, null)
+        .withOutput("line1\nline2", null, true, false);
+    const r = event.result.?;
+    try std.testing.expectEqualStrings("line1\nline2", r.stdout.?);
+    try std.testing.expect(r.stderr == null);
+    try std.testing.expect(r.stdout_truncated);
+    try std.testing.expect(!r.stderr_truncated);
+
+    var buf: [2048]u8 = undefined;
+    var ev = event;
+    const json = try ev.writeJson(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"stdout\":\"line1\\nline2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"stdout_truncated\":true") != null);
+}
+
+test "audit event with tool call context" {
+    const event = AuditEvent.init(.tool_call)
+        .withActor("runtime", null, null)
+        .withToolCall("memory_store", "tool-123")
+        .withResult(true, null, 11, null)
+        .withOutputPreview("stored preference key=theme", false);
+
+    var buf: [2048]u8 = undefined;
+    var ev = event;
+    const json = try ev.writeJson(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"event_type\":\"tool_call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_call\":{\"name\":\"memory_store\",\"tool_call_id\":\"tool-123\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"output_preview\":\"stored preference key=theme\"") != null);
 }
 
 test "audit event with result error message" {
@@ -414,6 +620,7 @@ test "audit event json contains security context" {
 
 test "audit event default security context" {
     const event = AuditEvent.init(.command_execution);
+    try std.testing.expect(event.session_id != 0);
     try std.testing.expect(!event.security.policy_violation);
     try std.testing.expect(event.security.rate_limit_remaining == null);
     try std.testing.expect(event.security.sandbox_backend == null);
@@ -424,6 +631,10 @@ test "audit config defaults" {
     try std.testing.expect(cfg.enabled);
     try std.testing.expectEqualStrings("audit.log", cfg.log_path);
     try std.testing.expectEqual(@as(u32, 10), cfg.max_size_mb);
+    try std.testing.expect(!cfg.capture_shell_output);
+    try std.testing.expectEqual(@as(u32, 2048), cfg.max_output_bytes);
+    try std.testing.expect(!cfg.capture_tool_output);
+    try std.testing.expectEqual(@as(u32, 512), cfg.max_tool_output_bytes);
 }
 
 test "audit config custom" {
@@ -431,10 +642,18 @@ test "audit config custom" {
         .enabled = false,
         .log_path = "custom.log",
         .max_size_mb = 50,
+        .capture_shell_output = true,
+        .max_output_bytes = 1024,
+        .capture_tool_output = true,
+        .max_tool_output_bytes = 256,
     };
     try std.testing.expect(!cfg.enabled);
     try std.testing.expectEqualStrings("custom.log", cfg.log_path);
     try std.testing.expectEqual(@as(u32, 50), cfg.max_size_mb);
+    try std.testing.expect(cfg.capture_shell_output);
+    try std.testing.expectEqual(@as(u32, 1024), cfg.max_output_bytes);
+    try std.testing.expect(cfg.capture_tool_output);
+    try std.testing.expectEqual(@as(u32, 256), cfg.max_tool_output_bytes);
 }
 
 test "audit logger enabled writes to file" {
@@ -493,18 +712,73 @@ test "audit command execution log" {
         .allowed = true,
         .success = true,
         .duration_ms = 15,
+        .stdout = "on branch main",
+        .stderr = "warn",
+        .stdout_truncated = false,
+        .stderr_truncated = true,
     });
 
     const stat = try tmp_dir.dir.statFile("cmd_audit.log");
     try std.testing.expect(stat.size > 0);
+
+    const content = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "cmd_audit.log", 4096);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"stdout\":\"on branch main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"stderr\":\"warn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"stderr_truncated\":true") != null);
+}
+
+test "audit tool call log" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const config = AuditConfig{ .enabled = true, .log_path = "tool_audit.log" };
+    var logger = try AuditLogger.init(std.testing.allocator, config, tmp_path);
+    defer logger.deinit();
+
+    try logger.logToolCall(.{
+        .channel = "runtime",
+        .name = "web_search",
+        .tool_call_id = "call-42",
+        .success = true,
+        .duration_ms = 33,
+        .output_preview = "Top results: zig 0.15 release notes...",
+        .output_preview_truncated = true,
+    });
+
+    const content = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "tool_audit.log", 4096);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"event_type\":\"tool_call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"name\":\"web_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"tool_call_id\":\"call-42\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"output_preview\":\"Top results: zig 0.15 release notes...\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"output_preview_truncated\":true") != null);
 }
 
 test "audit event ids are sequential" {
     const e1 = AuditEvent.init(.command_execution);
     const e2 = AuditEvent.init(.command_execution);
     const e3 = AuditEvent.init(.command_execution);
+    try std.testing.expectEqual(e1.session_id, e2.session_id);
+    try std.testing.expectEqual(e2.session_id, e3.session_id);
     try std.testing.expect(e2.event_id > e1.event_id);
     try std.testing.expect(e3.event_id > e2.event_id);
+}
+
+test "audit event uid contains session and event ids" {
+    var event = AuditEvent.init(.command_execution);
+    var buf: [1024]u8 = undefined;
+    const json = try event.writeJson(&buf);
+
+    var expected_uid: [48]u8 = undefined;
+    const expected_uid_text = try std.fmt.bufPrint(
+        &expected_uid,
+        "\"event_uid\":\"{x:0>16}-{x:0>16}\"",
+        .{ event.session_id, event.event_id },
+    );
+    try std.testing.expect(std.mem.indexOf(u8, json, expected_uid_text) != null);
 }
 
 test "audit event timestamp is reasonable" {

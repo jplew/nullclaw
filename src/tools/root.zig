@@ -292,6 +292,10 @@ pub fn allTools(
         allowed_paths: []const []const u8 = &.{},
         tools_config: @import("../config.zig").ToolsConfig = .{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
+        audit_logger: ?*const @import("../security/audit.zig").AuditLogger = null,
+        audit_channel: []const u8 = "runtime",
+        audit_capture_shell_output: bool = false,
+        audit_max_output_bytes: usize = 2048,
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -312,6 +316,10 @@ pub fn allTools(
         .timeout_ns = tc.shell_timeout_secs * std.time.ns_per_s,
         .max_output_bytes = tc.shell_max_output_bytes,
         .policy = opts.policy,
+        .audit_logger = opts.audit_logger,
+        .audit_channel = opts.audit_channel,
+        .audit_capture_output = opts.audit_capture_shell_output,
+        .audit_max_output_bytes = opts.audit_max_output_bytes,
     };
     try list.append(allocator, st.tool());
 
@@ -504,7 +512,11 @@ pub fn subagentTools(
         http_max_response_size: u32 = 1_000_000,
         allowed_paths: []const []const u8 = &.{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
+        audit_logger: ?*const @import("../security/audit.zig").AuditLogger = null,
+        audit_channel: []const u8 = "runtime",
         tools_config: @import("../config.zig").ToolsConfig = .{},
+        audit_capture_shell_output: bool = false,
+        audit_max_output_bytes: usize = 2048,
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -524,6 +536,10 @@ pub fn subagentTools(
         .timeout_ns = tc.shell_timeout_secs * std.time.ns_per_s,
         .max_output_bytes = tc.shell_max_output_bytes,
         .policy = opts.policy,
+        .audit_logger = opts.audit_logger,
+        .audit_channel = opts.audit_channel,
+        .audit_capture_output = opts.audit_capture_shell_output,
+        .audit_max_output_bytes = opts.audit_max_output_bytes,
     };
     try list.append(allocator, st.tool());
 

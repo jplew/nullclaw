@@ -22,6 +22,7 @@ const Observer = observability.Observer;
 const tools_mod = @import("tools/root.zig");
 const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
+const security_audit = @import("security/audit.zig");
 const streaming = @import("streaming.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
@@ -69,6 +70,8 @@ pub const SessionManager = struct {
     mem_rt: ?*memory_mod.MemoryRuntime = null,
     observer: Observer,
     policy: ?*const SecurityPolicy = null,
+    audit_logger: ?*const security_audit.AuditLogger = null,
+    audit_channel: []const u8 = "runtime",
 
     mutex: std.Thread.Mutex,
     usage_log_mutex: std.Thread.Mutex,
@@ -142,6 +145,8 @@ pub const SessionManager = struct {
             self.observer,
         );
         agent.policy = self.policy;
+        agent.audit_logger = self.audit_logger;
+        agent.audit_channel = self.audit_channel;
         agent.session_store = self.session_store;
         agent.response_cache = self.response_cache;
         agent.mem_rt = self.mem_rt;

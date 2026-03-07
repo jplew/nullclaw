@@ -1676,6 +1676,21 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .tracker = &tracker,
     };
 
+    var audit_logger_opt: ?yc.security.AuditLogger = null;
+    if (config.security.audit.enabled) {
+        audit_logger_opt = yc.security.AuditLogger.init(allocator, .{
+            .enabled = config.security.audit.enabled,
+            .log_path = config.security.audit.log_path,
+            .max_size_mb = config.security.audit.max_size_mb,
+            .capture_shell_output = config.security.audit.capture_shell_output,
+            .max_output_bytes = config.security.audit.max_output_bytes,
+        }, config.workspace_dir) catch |err| blk: {
+            std.debug.print("  Audit logger init failed: {}\n", .{err});
+            break :blk null;
+        };
+    }
+    defer if (audit_logger_opt) |*logger| logger.deinit();
+
     var subagent_manager = yc.subagent.SubagentManager.init(allocator, config, null, .{});
     subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
     defer subagent_manager.deinit();
@@ -1697,6 +1712,10 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .tools_config = config.tools,
         .allowed_paths = config.autonomy.allowed_paths,
         .policy = &sec_policy,
+        .audit_logger = if (audit_logger_opt) |*logger| logger else null,
+        .audit_channel = "signal",
+        .audit_capture_shell_output = config.security.audit.capture_shell_output,
+        .audit_max_output_bytes = @intCast(config.security.audit.max_output_bytes),
         .subagent_manager = &subagent_manager,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
@@ -1727,6 +1746,8 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     // Initialize session manager
     var session_mgr = yc.session.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
     session_mgr.policy = &sec_policy;
+    session_mgr.audit_logger = if (audit_logger_opt) |*logger| logger else null;
+    session_mgr.audit_channel = "signal";
     if (mem_rt) |*rt| {
         session_mgr.mem_rt = rt;
     }
@@ -1986,6 +2007,21 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .tracker = &tracker,
     };
 
+    var audit_logger_opt: ?yc.security.AuditLogger = null;
+    if (config.security.audit.enabled) {
+        audit_logger_opt = yc.security.AuditLogger.init(allocator, .{
+            .enabled = config.security.audit.enabled,
+            .log_path = config.security.audit.log_path,
+            .max_size_mb = config.security.audit.max_size_mb,
+            .capture_shell_output = config.security.audit.capture_shell_output,
+            .max_output_bytes = config.security.audit.max_output_bytes,
+        }, config.workspace_dir) catch |err| blk: {
+            std.debug.print("  Audit logger init failed: {}\n", .{err});
+            break :blk null;
+        };
+    }
+    defer if (audit_logger_opt) |*logger| logger.deinit();
+
     var subagent_manager = yc.subagent.SubagentManager.init(allocator, &config, null, .{});
     subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
     defer subagent_manager.deinit();
@@ -2007,6 +2043,10 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .tools_config = config.tools,
         .allowed_paths = config.autonomy.allowed_paths,
         .policy = &sec_policy,
+        .audit_logger = if (audit_logger_opt) |*logger| logger else null,
+        .audit_channel = "telegram",
+        .audit_capture_shell_output = config.security.audit.capture_shell_output,
+        .audit_max_output_bytes = @intCast(config.security.audit.max_output_bytes),
         .subagent_manager = &subagent_manager,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
@@ -2050,6 +2090,8 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 
     var session_mgr = yc.session.SessionManager.init(allocator, &config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
     session_mgr.policy = &sec_policy;
+    session_mgr.audit_logger = if (audit_logger_opt) |*logger| logger else null;
+    session_mgr.audit_channel = "telegram";
     if (mem_rt) |*rt| {
         session_mgr.mem_rt = rt;
     }

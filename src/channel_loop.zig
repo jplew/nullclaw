@@ -18,6 +18,7 @@ const voice = @import("voice.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
 const security = @import("security/policy.zig");
+const security_audit = @import("security/audit.zig");
 const subagent_mod = @import("subagent.zig");
 const subagent_runner = @import("subagent_runner.zig");
 const agent_routing = @import("agent_routing.zig");
@@ -334,6 +335,7 @@ pub const ChannelRuntime = struct {
     subagent_manager: ?*subagent_mod.SubagentManager,
     policy_tracker: *security.RateTracker,
     security_policy: *security.SecurityPolicy,
+    audit_logger: ?*security_audit.AuditLogger,
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
@@ -382,6 +384,27 @@ pub const ChannelRuntime = struct {
             .tracker = policy_tracker,
         };
 
+        const audit_logger: ?*security_audit.AuditLogger = blk: {
+            if (!config.security.audit.enabled) break :blk null;
+            const logger = allocator.create(security_audit.AuditLogger) catch break :blk null;
+            logger.* = security_audit.AuditLogger.init(allocator, .{
+                .enabled = config.security.audit.enabled,
+                .log_path = config.security.audit.log_path,
+                .max_size_mb = config.security.audit.max_size_mb,
+                .capture_shell_output = config.security.audit.capture_shell_output,
+                .max_output_bytes = config.security.audit.max_output_bytes,
+            }, config.workspace_dir) catch |err| {
+                log.warn("audit logger init failed: {}", .{err});
+                allocator.destroy(logger);
+                break :blk null;
+            };
+            break :blk logger;
+        };
+        errdefer if (audit_logger) |logger| {
+            logger.deinit();
+            allocator.destroy(logger);
+        };
+
         // Tools
         const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
             .http_enabled = config.http_request.enabled,
@@ -399,6 +422,10 @@ pub const ChannelRuntime = struct {
             .tools_config = config.tools,
             .allowed_paths = config.autonomy.allowed_paths,
             .policy = security_policy,
+            .audit_logger = audit_logger,
+            .audit_channel = "runtime",
+            .audit_capture_shell_output = config.security.audit.capture_shell_output,
+            .audit_max_output_bytes = @intCast(config.security.audit.max_output_bytes),
             .subagent_manager = subagent_manager,
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
@@ -417,6 +444,8 @@ pub const ChannelRuntime = struct {
         // Session manager
         var session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
         session_mgr.policy = security_policy;
+        session_mgr.audit_logger = audit_logger;
+        session_mgr.audit_channel = "runtime";
 
         // Self — heap-allocated so pointers remain stable
         const self = try allocator.create(ChannelRuntime);
@@ -431,6 +460,7 @@ pub const ChannelRuntime = struct {
             .subagent_manager = subagent_manager,
             .policy_tracker = policy_tracker,
             .security_policy = security_policy,
+            .audit_logger = audit_logger,
         };
         // Wire MemoryRuntime pointer into SessionManager for /doctor diagnostics
         // and into memory tools for retrieval pipeline + vector sync.
@@ -452,6 +482,10 @@ pub const ChannelRuntime = struct {
         }
         if (self.mem_rt) |*rt| rt.deinit();
         self.provider_bundle.deinit();
+        if (self.audit_logger) |logger| {
+            logger.deinit();
+            alloc.destroy(logger);
+        }
         self.policy_tracker.deinit();
         alloc.destroy(self.security_policy);
         alloc.destroy(self.policy_tracker);
