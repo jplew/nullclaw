@@ -82,19 +82,22 @@ pub const DelegateTool = struct {
 
         // Determine system prompt, API key, provider, model from agent config or defaults
         if (agent_cfg) |ac| {
-            // Use agent-specific config via completeWithSystem
+            // Use agent-specific config via provider factory/vtable path so
+            // OAuth-backed providers (e.g. openai-codex) work without API keys.
             const api_key = ac.api_key orelse self.fallback_api_key;
             const sys_prompt = ac.system_prompt orelse "You are a helpful assistant. Respond concisely.";
-
-            const cfg = .{
-                .api_key = api_key,
-                .default_provider = ac.provider,
-                .default_model = @as(?[]const u8, ac.model),
-                .temperature = ac.temperature orelse @as(f64, 0.7),
-                .max_tokens = @as(?u64, null),
-            };
-
-            const response = providers.completeWithSystem(allocator, &cfg, sys_prompt, full_prompt) catch |err| {
+            const response = completeViaProvider(
+                allocator,
+                ac.provider,
+                ac.model,
+                api_key,
+                null,
+                true,
+                null,
+                sys_prompt,
+                full_prompt,
+                ac.temperature orelse @as(f64, 0.7),
+            ) catch |err| {
                 const msg = std.fmt.allocPrint(
                     allocator,
                     "Delegation to agent '{s}' failed: {s}",
@@ -119,7 +122,22 @@ pub const DelegateTool = struct {
         ) catch return ToolResult.fail("Failed to build agent prompt");
         defer allocator.free(agent_prompt);
 
-        const response = providers.complete(allocator, &cfg, agent_prompt) catch |err| {
+        const default_model = cfg.default_model orelse {
+            return ToolResult.fail("Delegation failed: NoDefaultModel");
+        };
+
+        const response = completeViaProvider(
+            allocator,
+            cfg.default_provider,
+            default_model,
+            cfg.defaultProviderKey(),
+            cfg.getProviderBaseUrl(cfg.default_provider),
+            cfg.getProviderNativeTools(cfg.default_provider),
+            cfg.getProviderUserAgent(cfg.default_provider),
+            "You are a helpful assistant. Respond concisely.",
+            agent_prompt,
+            cfg.temperature,
+        ) catch |err| {
             const msg = std.fmt.allocPrint(
                 allocator,
                 "Delegation to agent '{s}' failed: {s}",
@@ -129,6 +147,38 @@ pub const DelegateTool = struct {
         };
 
         return ToolResult{ .success = true, .output = response };
+    }
+
+    fn completeViaProvider(
+        allocator: std.mem.Allocator,
+        provider_name: []const u8,
+        model_name: []const u8,
+        api_key: ?[]const u8,
+        base_url: ?[]const u8,
+        native_tools: bool,
+        user_agent: ?[]const u8,
+        system_prompt: []const u8,
+        prompt: []const u8,
+        temperature: f64,
+    ) ![]const u8 {
+        var holder = providers.ProviderHolder.fromConfig(
+            allocator,
+            provider_name,
+            api_key,
+            base_url,
+            native_tools,
+            user_agent,
+        );
+        defer holder.deinit();
+
+        const provider = holder.provider();
+        return provider.chatWithSystem(
+            allocator,
+            system_prompt,
+            prompt,
+            model_name,
+            temperature,
+        );
     }
 
     fn findAgent(self: *DelegateTool, name: []const u8) ?NamedAgentConfig {

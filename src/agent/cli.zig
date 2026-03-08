@@ -13,6 +13,7 @@ const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
+const bootstrap_mod = @import("../bootstrap/root.zig");
 const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
@@ -20,6 +21,7 @@ const subagent_mod = @import("../subagent.zig");
 const subagent_runner = @import("../subagent_runner.zig");
 const cli_mod = @import("../channels/cli.zig");
 const security = @import("../security/policy.zig");
+const security_audit = @import("../security/audit.zig");
 const auth_mod = @import("../auth.zig");
 const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
@@ -70,6 +72,17 @@ fn maybePrintAllProvidersFailedHint(
         "Hint: openai-codex is authenticated, but current provider is {s}. Set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" or run with --provider openai-codex --model gpt-5.3-codex.\n",
         .{default_provider},
     );
+}
+
+fn maybePrintLastProviderApiError(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+) !void {
+    const detail = providers.snapshotLastApiErrorDetail(allocator) catch null;
+    if (detail) |msg| {
+        defer allocator.free(msg);
+        try w.print("Last provider error: {s}\n", .{msg});
+    }
 }
 
 const ParsedAgentArgs = struct {
@@ -164,7 +177,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     // Ensure lifecycle parity: seed workspace files on first agent run
     // so prompts always have the expected bootstrap context.
-    try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &onboard.ProjectContext{});
+    try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &onboard.ProjectContext{}, null);
 
     var out_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&out_buf);
@@ -203,12 +216,28 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .autonomy = cfg.autonomy.level,
         .workspace_dir = cfg.workspace_dir,
         .workspace_only = cfg.autonomy.workspace_only,
-        .allowed_commands = if (cfg.autonomy.allowed_commands.len > 0) cfg.autonomy.allowed_commands else &security.default_allowed_commands,
+        .allowed_commands = security.resolveAllowedCommands(cfg.autonomy.level, cfg.autonomy.allowed_commands),
         .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
         .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
         .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+        .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
         .tracker = &tracker,
     };
+
+    var audit_logger_opt: ?security_audit.AuditLogger = null;
+    if (cfg.security.audit.enabled) {
+        audit_logger_opt = security_audit.AuditLogger.init(allocator, .{
+            .enabled = cfg.security.audit.enabled,
+            .log_path = cfg.security.audit.log_path,
+            .max_size_mb = cfg.security.audit.max_size_mb,
+            .capture_shell_output = cfg.security.audit.capture_shell_output,
+            .max_output_bytes = cfg.security.audit.max_output_bytes,
+        }, cfg.workspace_dir) catch |err| blk: {
+            log.warn("audit logger init failed: {}", .{err});
+            break :blk null;
+        };
+    }
+    defer if (audit_logger_opt) |*logger| logger.deinit();
 
     // Provider runtime bundle (primary provider + reliability wrapper).
     var runtime_provider = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &cfg);
@@ -218,6 +247,19 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var subagent_manager = subagent_mod.SubagentManager.init(allocator, &cfg, null, .{});
     subagent_manager.task_runner = subagent_runner.runTaskWithTools;
     defer subagent_manager.deinit();
+
+    // Optional memory backend.
+    var mem_rt = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
+    defer if (mem_rt) |*rt| rt.deinit();
+    const mem_opt: ?Memory = if (mem_rt) |rt| rt.memory else null;
+
+    const bootstrap_provider: ?bootstrap_mod.BootstrapProvider = bootstrap_mod.createProvider(
+        allocator,
+        cfg.memory.backend,
+        mem_opt,
+        cfg.workspace_dir,
+    ) catch null;
+    defer if (bootstrap_provider) |bp| bp.deinit();
 
     // Create tools (with agents config for delegate depth enforcement)
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
@@ -235,14 +277,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .tools_config = cfg.tools,
         .allowed_paths = cfg.autonomy.allowed_paths,
         .policy = &policy,
+        .audit_logger = if (audit_logger_opt) |*logger| logger else null,
+        .audit_channel = "cli",
+        .audit_capture_shell_output = cfg.security.audit.capture_shell_output,
+        .audit_max_output_bytes = @intCast(cfg.security.audit.max_output_bytes),
         .subagent_manager = &subagent_manager,
+        .bootstrap_provider = bootstrap_provider,
+        .backend_name = cfg.memory.backend,
     });
     defer tools_mod.deinitTools(allocator, tools);
-
-    // Create memory (optional — don't fail if it can't init)
-    var mem_rt = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
-    defer if (mem_rt) |*rt| rt.deinit();
-    const mem_opt: ?Memory = if (mem_rt) |rt| rt.memory else null;
 
     // Bind memory backend once for this tool set before creating agents.
     tools_mod.bindMemoryTools(tools, mem_opt);
@@ -267,6 +310,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
         var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
         agent.policy = &policy;
+        agent.audit_logger = if (audit_logger_opt) |*logger| logger else null;
+        agent.audit_channel = "cli";
         agent.session_store = if (mem_rt) |rt| rt.session_store else null;
         agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
         agent.mem_rt = if (mem_rt) |*rt| rt else null;
@@ -295,6 +340,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 return;
             }
             if (err == error.AllProvidersFailed) {
+                try maybePrintLastProviderApiError(allocator, w);
                 try maybePrintAllProvidersFailedHint(allocator, w, cfg.default_provider);
                 try w.flush();
             }
@@ -361,6 +407,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
     agent.policy = &policy;
+    agent.audit_logger = if (audit_logger_opt) |*logger| logger else null;
+    agent.audit_channel = "cli";
     agent.session_store = if (mem_rt) |rt| rt.session_store else null;
     agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
     agent.mem_rt = if (mem_rt) |*rt| rt else null;
@@ -410,6 +458,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
             } else if (err == error.AllProvidersFailed) {
                 try w.print("Error: {}\n", .{err});
+                try maybePrintLastProviderApiError(allocator, w);
                 try maybePrintAllProvidersFailedHint(allocator, w, cfg.default_provider);
             } else {
                 try w.print("Error: {}\n", .{err});

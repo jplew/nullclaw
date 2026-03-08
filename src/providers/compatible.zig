@@ -70,10 +70,24 @@ pub const OpenAiCompatibleProvider = struct {
     /// When set, cap max_tokens in non-streaming requests to this value.
     /// Some providers (e.g. Fireworks) reject large max_tokens without streaming.
     max_tokens_non_streaming: ?u32 = null,
+    /// When true, include `"thinking":{"type":"enabled"}` in request bodies
+    /// when reasoning_effort is set. Required by Z.AI/GLM thinking models.
+    thinking_param: bool = false,
+    /// When true, include `"enable_thinking":true` in request bodies
+    /// when reasoning_effort is set. Required by Qwen (DashScope compatible mode).
+    enable_thinking_param: bool = false,
+    /// When true, include `"reasoning_split":true` in request bodies
+    /// when reasoning_effort is set. Used by MiniMax to separate reasoning output.
+    reasoning_split_param: bool = false,
     /// Optional User-Agent header for HTTP requests.
     /// When set, requests will include "User-Agent: {value}" header.
     user_agent: ?[]const u8 = null,
     allocator: std.mem.Allocator,
+
+    const think_open_tag = "<think>";
+    const think_close_tag = "</think>";
+    const splitThinkContent = root.splitThinkContent;
+    const stripThinkBlocks = root.stripThinkBlocks;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -203,7 +217,7 @@ pub const OpenAiCompatibleProvider = struct {
             if (ot == .string) {
                 const trimmed = std.mem.trim(u8, ot.string, " \t\n\r");
                 if (trimmed.len > 0) {
-                    return try allocator.dupe(u8, trimmed);
+                    return stripThinkBlocks(allocator, trimmed);
                 }
             }
         }
@@ -220,7 +234,7 @@ pub const OpenAiCompatibleProvider = struct {
                                     if (text == .string) {
                                         const trimmed = std.mem.trim(u8, text.string, " \t\n\r");
                                         if (trimmed.len > 0) {
-                                            return try allocator.dupe(u8, trimmed);
+                                            return stripThinkBlocks(allocator, trimmed);
                                         }
                                     }
                                 }
@@ -240,7 +254,7 @@ pub const OpenAiCompatibleProvider = struct {
                             if (text == .string) {
                                 const trimmed = std.mem.trim(u8, text.string, " \t\n\r");
                                 if (trimmed.len > 0) {
-                                    return try allocator.dupe(u8, trimmed);
+                                    return stripThinkBlocks(allocator, trimmed);
                                 }
                             }
                         }
@@ -343,6 +357,106 @@ pub const OpenAiCompatibleProvider = struct {
         needs_free: bool,
     };
 
+    const ThinkStripStreamCtx = struct {
+        downstream: root.StreamCallback,
+        downstream_ctx: *anyopaque,
+        state: ThinkStripStreamState = .{},
+    };
+
+    const ThinkStripStreamState = struct {
+        depth: usize = 0,
+        pending: [think_close_tag.len]u8 = undefined,
+        pending_len: usize = 0,
+
+        fn feed(self: *ThinkStripStreamState, delta: []const u8, downstream: root.StreamCallback, downstream_ctx: *anyopaque) void {
+            var out_buf: [256]u8 = undefined;
+            var out_len: usize = 0;
+
+            for (delta) |byte| {
+                if (self.pending_len == self.pending.len) {
+                    self.processPending(false, &out_buf, &out_len, downstream, downstream_ctx);
+                }
+                self.pending[self.pending_len] = byte;
+                self.pending_len += 1;
+                self.processPending(false, &out_buf, &out_len, downstream, downstream_ctx);
+            }
+
+            if (out_len > 0) {
+                downstream(downstream_ctx, root.StreamChunk.textDelta(out_buf[0..out_len]));
+            }
+        }
+
+        fn finish(self: *ThinkStripStreamState, downstream: root.StreamCallback, downstream_ctx: *anyopaque) void {
+            var out_buf: [256]u8 = undefined;
+            var out_len: usize = 0;
+            self.processPending(true, &out_buf, &out_len, downstream, downstream_ctx);
+            if (out_len > 0) {
+                downstream(downstream_ctx, root.StreamChunk.textDelta(out_buf[0..out_len]));
+            }
+        }
+
+        fn processPending(
+            self: *ThinkStripStreamState,
+            final: bool,
+            out_buf: *[256]u8,
+            out_len: *usize,
+            downstream: root.StreamCallback,
+            downstream_ctx: *anyopaque,
+        ) void {
+            while (self.pending_len > 0) {
+                const pending = self.pending[0..self.pending_len];
+
+                if (pending.len >= think_open_tag.len and std.mem.eql(u8, pending[0..think_open_tag.len], think_open_tag)) {
+                    self.consumePrefix(think_open_tag.len);
+                    self.depth += 1;
+                    continue;
+                }
+
+                if (pending.len >= think_close_tag.len and std.mem.eql(u8, pending[0..think_close_tag.len], think_close_tag)) {
+                    self.consumePrefix(think_close_tag.len);
+                    if (self.depth > 0) self.depth -= 1;
+                    continue;
+                }
+
+                const maybe_tag_prefix = std.mem.startsWith(u8, think_open_tag, pending) or std.mem.startsWith(u8, think_close_tag, pending);
+                if (!final and maybe_tag_prefix and pending.len < think_close_tag.len) {
+                    break;
+                }
+
+                if (self.depth == 0) {
+                    out_buf[out_len.*] = pending[0];
+                    out_len.* += 1;
+                    if (out_len.* == out_buf.len) {
+                        downstream(downstream_ctx, root.StreamChunk.textDelta(out_buf[0..out_len.*]));
+                        out_len.* = 0;
+                    }
+                }
+                self.consumePrefix(1);
+            }
+        }
+
+        fn consumePrefix(self: *ThinkStripStreamState, n: usize) void {
+            std.debug.assert(n <= self.pending_len);
+            if (n == self.pending_len) {
+                self.pending_len = 0;
+                return;
+            }
+            const remaining = self.pending_len - n;
+            std.mem.copyForwards(u8, self.pending[0..remaining], self.pending[n..self.pending_len]);
+            self.pending_len = remaining;
+        }
+    };
+
+    fn streamThinkSanitizeCallback(ctx_ptr: *anyopaque, chunk: root.StreamChunk) void {
+        const ctx: *ThinkStripStreamCtx = @ptrCast(@alignCast(ctx_ptr));
+        if (chunk.is_final) {
+            ctx.state.finish(ctx.downstream, ctx.downstream_ctx);
+            ctx.downstream(ctx.downstream_ctx, root.StreamChunk.finalChunk());
+            return;
+        }
+        ctx.state.feed(chunk.delta, ctx.downstream, ctx.downstream_ctx);
+    }
+
     /// Parse text content from an OpenAI-compatible response.
     pub fn parseTextResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -350,7 +464,13 @@ pub const OpenAiCompatibleProvider = struct {
         const root_obj = parsed.value.object;
 
         if (error_classify.classifyKnownApiError(root_obj)) |kind| {
-            return error_classify.kindToError(kind);
+            const mapped_err = error_classify.kindToError(kind);
+            var summary_buf: [1024]u8 = undefined;
+            const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
+            const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+            defer if (sanitized) |s| allocator.free(s);
+            root.setLastApiErrorDetail("compatible", sanitized orelse summary);
+            return mapped_err;
         }
 
         if (root_obj.get("choices")) |choices| {
@@ -358,7 +478,7 @@ pub const OpenAiCompatibleProvider = struct {
                 if (choices.array.items[0].object.get("message")) |msg| {
                     if (msg.object.get("content")) |content| {
                         if (content == .string) {
-                            return try allocator.dupe(u8, content.string);
+                            return stripThinkBlocks(allocator, content.string);
                         }
                     }
                 }
@@ -375,7 +495,13 @@ pub const OpenAiCompatibleProvider = struct {
         const root_obj = parsed.value.object;
 
         if (error_classify.classifyKnownApiError(root_obj)) |kind| {
-            return error_classify.kindToError(kind);
+            const mapped_err = error_classify.kindToError(kind);
+            var summary_buf: [1024]u8 = undefined;
+            const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
+            const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+            defer if (sanitized) |s| allocator.free(s);
+            root.setLastApiErrorDetail("compatible", sanitized orelse summary);
+            return mapped_err;
         }
 
         if (root_obj.get("choices")) |choices| {
@@ -384,9 +510,27 @@ pub const OpenAiCompatibleProvider = struct {
                 const msg_obj = msg.object;
 
                 var content: ?[]const u8 = null;
+                var reasoning_content: ?[]const u8 = null;
                 if (msg_obj.get("content")) |c| {
                     if (c == .string) {
-                        content = try allocator.dupe(u8, c.string);
+                        const split = try splitThinkContent(allocator, c.string);
+                        content = split.visible;
+                        reasoning_content = split.reasoning;
+                    }
+                }
+                // Fallback: some providers return reasoning in native fields.
+                // - Z.AI/GLM: `reasoning_content`
+                // - Groq/Cerebras parsed format: `reasoning`
+                if (reasoning_content == null) {
+                    if (msg_obj.get("reasoning_content")) |rc| {
+                        if (rc == .string and rc.string.len > 0)
+                            reasoning_content = try allocator.dupe(u8, rc.string);
+                    }
+                }
+                if (reasoning_content == null) {
+                    if (msg_obj.get("reasoning")) |rc| {
+                        if (rc == .string and rc.string.len > 0)
+                            reasoning_content = try allocator.dupe(u8, rc.string);
                     }
                 }
 
@@ -433,6 +577,7 @@ pub const OpenAiCompatibleProvider = struct {
                     .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
                     .usage = usage,
                     .model = model_str,
+                    .reasoning_content = reasoning_content,
                 };
             }
         }
@@ -474,7 +619,16 @@ pub const OpenAiCompatibleProvider = struct {
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
 
-        const body = try buildStreamingChatRequestBody(allocator, request, effective_model, temperature, self.merge_system_into_user);
+        const body = try buildStreamingChatRequestBody(
+            allocator,
+            request,
+            effective_model,
+            temperature,
+            self.merge_system_into_user,
+            self.thinking_param,
+            self.enable_thinking_param,
+            self.reasoning_split_param,
+        );
         defer allocator.free(body);
 
         const auth = try self.authHeaderValue(allocator);
@@ -500,7 +654,35 @@ pub const OpenAiCompatibleProvider = struct {
             extra_header_count += 1;
         }
 
-        return sse.curlStream(allocator, url, body, auth_hdr, extra_headers[0..extra_header_count], request.timeout_secs, callback, callback_ctx);
+        var sanitize_ctx = ThinkStripStreamCtx{
+            .downstream = callback,
+            .downstream_ctx = callback_ctx,
+        };
+
+        var result = try sse.curlStream(
+            allocator,
+            url,
+            body,
+            auth_hdr,
+            extra_headers[0..extra_header_count],
+            request.timeout_secs,
+            streamThinkSanitizeCallback,
+            @ptrCast(&sanitize_ctx),
+        );
+
+        if (result.content) |raw| {
+            const cleaned = try stripThinkBlocks(allocator, raw);
+            allocator.free(raw);
+            if (cleaned.len == 0) {
+                result.content = null;
+                result.usage.completion_tokens = 0;
+            } else {
+                result.content = cleaned;
+                result.usage.completion_tokens = @intCast((cleaned.len + 3) / 4);
+            }
+        }
+
+        return result;
     }
 
     fn supportsStreamingImpl(_: *anyopaque) bool {
@@ -589,7 +771,16 @@ pub const OpenAiCompatibleProvider = struct {
         defer allocator.free(url);
 
         const capped_request = self.capNonStreamingMaxTokens(request);
-        const body = try buildChatRequestBody(allocator, capped_request, effective_model, temperature, self.merge_system_into_user);
+        const body = try buildChatRequestBody(
+            allocator,
+            capped_request,
+            effective_model,
+            temperature,
+            self.merge_system_into_user,
+            self.thinking_param,
+            self.enable_thinking_param,
+            self.reasoning_split_param,
+        );
         defer allocator.free(body);
 
         const auth = try self.authHeaderValue(allocator);
@@ -730,9 +921,13 @@ fn buildChatRequestBody(
     model: []const u8,
     temperature: f64,
     merge_system: bool,
+    thinking_param: bool,
+    enable_thinking_param: bool,
+    reasoning_split_param: bool,
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
+    const reasoning_enabled = hasCompatReasoningEnabled(request.reasoning_effort);
 
     try buf.appendSlice(allocator, "{\"model\":\"");
     try buf.appendSlice(allocator, model);
@@ -742,6 +937,15 @@ fn buildChatRequestBody(
 
     try buf.append(allocator, ']');
     try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
+    if (thinking_param and reasoning_enabled) {
+        try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
+    }
+    if (enable_thinking_param and reasoning_enabled) {
+        try buf.appendSlice(allocator, ",\"enable_thinking\":true");
+    }
+    if (reasoning_split_param and reasoning_enabled) {
+        try buf.appendSlice(allocator, ",\"reasoning_split\":true");
+    }
     if (request.tools) |tools| {
         if (tools.len > 0) {
             try buf.appendSlice(allocator, ",\"tools\":");
@@ -762,9 +966,13 @@ fn buildStreamingChatRequestBody(
     model: []const u8,
     temperature: f64,
     merge_system: bool,
+    thinking_param: bool,
+    enable_thinking_param: bool,
+    reasoning_split_param: bool,
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
+    const reasoning_enabled = hasCompatReasoningEnabled(request.reasoning_effort);
 
     try buf.appendSlice(allocator, "{\"model\":\"");
     try buf.appendSlice(allocator, model);
@@ -774,6 +982,15 @@ fn buildStreamingChatRequestBody(
 
     try buf.append(allocator, ']');
     try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
+    if (thinking_param and reasoning_enabled) {
+        try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
+    }
+    if (enable_thinking_param and reasoning_enabled) {
+        try buf.appendSlice(allocator, ",\"enable_thinking\":true");
+    }
+    if (reasoning_split_param and reasoning_enabled) {
+        try buf.appendSlice(allocator, ",\"reasoning_split\":true");
+    }
     if (request.tools) |tools| {
         if (tools.len > 0) {
             try buf.appendSlice(allocator, ",\"tools\":");
@@ -785,6 +1002,11 @@ fn buildStreamingChatRequestBody(
     try buf.appendSlice(allocator, ",\"stream\":true}");
 
     return try buf.toOwnedSlice(allocator);
+}
+
+fn hasCompatReasoningEnabled(reasoning_effort: ?[]const u8) bool {
+    const effort = root.normalizeOpenAiReasoningEffort(reasoning_effort) orelse return false;
+    return !std.mem.eql(u8, effort, "none");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -838,6 +1060,224 @@ test "parseTextResponse extracts content" {
     const result = try OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("Hello from Venice!", result);
+}
+
+test "parseTextResponse strips think blocks" {
+    const body =
+        \\{"choices":[{"message":{"content":"<think>private reasoning</think>\nVisible answer"}}]}
+    ;
+    const result = try OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("Visible answer", result);
+}
+
+test "parseNativeResponse splits think blocks into content and reasoning_content" {
+    const body =
+        \\{"choices":[{"message":{"content":"<think>private chain of thought</think>\nVisible answer"}}],"model":"minimax-m2.5"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |content| {
+            if (content.len > 0) std.testing.allocator.free(content);
+        }
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |reasoning| {
+            if (reasoning.len > 0) std.testing.allocator.free(reasoning);
+        }
+    }
+    try std.testing.expect(result.content != null);
+    try std.testing.expectEqualStrings("Visible answer", result.content.?);
+    try std.testing.expect(result.reasoning_content != null);
+    try std.testing.expectEqualStrings("private chain of thought", result.reasoning_content.?);
+}
+
+test "parseNativeResponse reads native reasoning_content field (Z.AI/GLM style)" {
+    const body =
+        \\{"choices":[{"message":{"content":"Final answer","reasoning_content":"chain of thought"}}],"model":"glm-4.7-thinking"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.content != null);
+    try std.testing.expectEqualStrings("Final answer", result.content.?);
+    try std.testing.expect(result.reasoning_content != null);
+    try std.testing.expectEqualStrings("chain of thought", result.reasoning_content.?);
+}
+
+test "parseNativeResponse reads native reasoning field (Groq/Cerebras parsed format)" {
+    const body =
+        \\{"choices":[{"message":{"content":"Final answer","reasoning":"parsed reasoning trace"}}],"model":"qwen/qwen3-32b"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.content != null);
+    try std.testing.expectEqualStrings("Final answer", result.content.?);
+    try std.testing.expect(result.reasoning_content != null);
+    try std.testing.expectEqualStrings("parsed reasoning trace", result.reasoning_content.?);
+}
+
+test "buildChatRequestBody emits thinking param for GLM when reasoning_effort set" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("test")};
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "glm-4.7-thinking",
+        .reasoning_effort = "high",
+    };
+    const body = try buildChatRequestBody(allocator, req, "glm-4.7-thinking", 0.7, false, true, false, false);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"}") != null);
+}
+
+test "buildChatRequestBody omits thinking param when thinking_param false" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("test")};
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "some-model",
+        .reasoning_effort = "high",
+    };
+    const body = try buildChatRequestBody(allocator, req, "some-model", 0.7, false, false, false, false);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+}
+
+test "buildChatRequestBody emits enable_thinking when configured" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("test")};
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "qwen3-thinking",
+        .reasoning_effort = "high",
+    };
+    const body = try buildChatRequestBody(allocator, req, "qwen3-thinking", 0.7, false, false, true, false);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") != null);
+}
+
+test "buildChatRequestBody emits reasoning_split when configured" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("test")};
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "minimax-m2",
+        .reasoning_effort = "high",
+    };
+    const body = try buildChatRequestBody(allocator, req, "minimax-m2", 0.7, false, false, false, true);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") != null);
+}
+
+test "buildChatRequestBody omits provider thinking params when reasoning_effort none" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("test")};
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "glm-4.7-thinking",
+        .reasoning_effort = "none",
+    };
+    const body = try buildChatRequestBody(allocator, req, "glm-4.7-thinking", 0.7, false, true, true, true);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") == null);
+}
+
+test "streamThinkSanitizeCallback strips think blocks across chunk boundaries" {
+    const Collector = struct {
+        allocator: std.mem.Allocator,
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+        saw_final: bool = false,
+
+        fn callback(ctx: *anyopaque, chunk: root.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (chunk.is_final) {
+                self.saw_final = true;
+                return;
+            }
+            self.buf.appendSlice(self.allocator, chunk.delta) catch unreachable;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.buf.deinit(self.allocator);
+        }
+    };
+
+    var collector = Collector{ .allocator = std.testing.allocator };
+    defer collector.deinit();
+
+    var sanitize_ctx = OpenAiCompatibleProvider.ThinkStripStreamCtx{
+        .downstream = Collector.callback,
+        .downstream_ctx = @ptrCast(&collector),
+    };
+
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("<thi"));
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("nk>private reasoning"));
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("</think>\nVisible answer"));
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.finalChunk());
+
+    try std.testing.expect(collector.saw_final);
+    try std.testing.expectEqualStrings("\nVisible answer", collector.buf.items);
+}
+
+test "streamThinkSanitizeCallback preserves incomplete think tag literals" {
+    const Collector = struct {
+        allocator: std.mem.Allocator,
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+        saw_final: bool = false,
+
+        fn callback(ctx: *anyopaque, chunk: root.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (chunk.is_final) {
+                self.saw_final = true;
+                return;
+            }
+            self.buf.appendSlice(self.allocator, chunk.delta) catch unreachable;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.buf.deinit(self.allocator);
+        }
+    };
+
+    var collector = Collector{ .allocator = std.testing.allocator };
+    defer collector.deinit();
+
+    var sanitize_ctx = OpenAiCompatibleProvider.ThinkStripStreamCtx{
+        .downstream = Collector.callback,
+        .downstream_ctx = @ptrCast(&collector),
+    };
+
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("literal <thi"));
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.finalChunk());
+
+    try std.testing.expect(collector.saw_final);
+    try std.testing.expectEqualStrings("literal <thi", collector.buf.items);
 }
 
 test "parseTextResponse empty choices" {
@@ -1065,6 +1505,15 @@ test "extractResponsesText top-level output_text" {
     try std.testing.expectEqualStrings("Hello from top-level", result);
 }
 
+test "extractResponsesText strips think blocks" {
+    const body =
+        \\{"output_text":"<think>private reasoning</think>\nVisible answer","output":[]}
+    ;
+    const result = try OpenAiCompatibleProvider.extractResponsesText(std.testing.allocator, body);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("Visible answer", result);
+}
+
 test "extractResponsesText nested output_text type" {
     const body =
         \\{"output":[{"content":[{"type":"output_text","text":"Hello from nested"}]}]}
@@ -1148,10 +1597,25 @@ test "buildStreamingChatRequestBody contains stream true" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "test-model" };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false);
+    const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false, false, false, false);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+}
+
+test "buildStreamingChatRequestBody omits provider thinking params when reasoning_effort none" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "test-model",
+        .reasoning_effort = "none",
+    };
+    const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false, true, true, true);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") == null);
 }
 
 test "supportsStreaming returns true for compatible" {
@@ -1176,10 +1640,10 @@ test "streaming body has same messages as non-streaming" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("test message")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const non_stream = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
+    const non_stream = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false);
     defer allocator.free(non_stream);
 
-    const stream = try buildStreamingChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
+    const stream = try buildStreamingChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false);
     defer allocator.free(stream);
 
     // Both should contain the message
@@ -1196,7 +1660,7 @@ test "streaming body has model field" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "custom-model" };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "custom-model", 0.5, false);
+    const body = try buildStreamingChatRequestBody(allocator, req, "custom-model", 0.5, false, false, false, false);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "custom-model") != null);
@@ -1211,7 +1675,7 @@ test "buildChatRequestBody without content_parts serializes plain string" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("plain text")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false);
     defer allocator.free(body);
 
     // Verify it's valid JSON
@@ -1238,7 +1702,7 @@ test "buildChatRequestBody with image_url content_parts serializes OpenAI array"
     }};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false);
     defer allocator.free(body);
 
     // Verify it's valid JSON
@@ -1276,7 +1740,7 @@ test "buildChatRequestBody with base64 image serializes as data URI" {
     }};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false);
     defer allocator.free(body);
 
     // Should contain the data URI
@@ -1295,7 +1759,7 @@ test "buildChatRequestBody with high detail image_url" {
     }};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1324,7 +1788,7 @@ test "buildChatRequestBody o1 omits temperature" {
         .max_tokens = 100,
     };
 
-    const body = try buildChatRequestBody(allocator, req, "o1", 0.7, false);
+    const body = try buildChatRequestBody(allocator, req, "o1", 0.7, false, false, false, false);
     defer allocator.free(body);
 
     // Reasoning model: no temperature, uses max_completion_tokens
@@ -1343,7 +1807,7 @@ test "buildStreamingChatRequestBody reasoning model omits temperature" {
         .max_tokens = 200,
     };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "gpt-5.2", 0.5, false);
+    const body = try buildStreamingChatRequestBody(allocator, req, "gpt-5.2", 0.5, false, false, false, false);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
@@ -1363,7 +1827,7 @@ test "merge_system_into_user merges system into first user message" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1385,7 +1849,7 @@ test "merge_system_into_user with no system messages passes through" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1404,7 +1868,7 @@ test "merge_system_into_user false keeps system messages" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, false);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, false, false, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1430,7 +1894,7 @@ test "merge_system_into_user with multiple system messages concatenates" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1454,7 +1918,7 @@ test "merge_system_into_user preserves assistant messages" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1481,7 +1945,7 @@ test "merge_system_into_user streaming body also merges" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "test", 0.7, true);
+    const body = try buildStreamingChatRequestBody(allocator, req, "test", 0.7, true, false, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});

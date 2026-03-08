@@ -40,6 +40,8 @@ pub const ModelFallbackEntry = config_types.ModelFallbackEntry;
 pub const ReliabilityConfig = config_types.ReliabilityConfig;
 pub const SchedulerConfig = config_types.SchedulerConfig;
 pub const AgentConfig = config_types.AgentConfig;
+pub const ToolFilterGroup = config_types.ToolFilterGroup;
+pub const ToolFilterGroupMode = config_types.ToolFilterGroupMode;
 pub const ModelRouteConfig = config_types.ModelRouteConfig;
 pub const HeartbeatConfig = config_types.HeartbeatConfig;
 pub const CronConfig = config_types.CronConfig;
@@ -781,6 +783,10 @@ pub const Config = struct {
                 .log_path = self.security.audit.log_path,
                 .max_size_mb = self.security.audit.max_size_mb,
                 .sign_events = self.security.audit.sign_events,
+                .capture_shell_output = self.security.audit.capture_shell_output,
+                .max_output_bytes = self.security.audit.max_output_bytes,
+                .capture_tool_output = self.security.audit.capture_tool_output,
+                .max_tool_output_bytes = self.security.audit.max_tool_output_bytes,
             },
         }, .{})});
         try w.print("  \"peripherals\": {f},\n", .{std.json.fmt(.{
@@ -1470,6 +1476,42 @@ test "json parse memory weights accept integer values" {
     try std.testing.expectEqual(@as(f64, 0.0), cfg.memory.search.query.hybrid.text_weight);
 }
 
+test "json parse memory sqlite_ann store options" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"memory":{"search":{"store":{"kind":"sqlite_ann","ann_candidate_multiplier":9,"ann_min_candidates":77}}}}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("sqlite_ann", cfg.memory.search.store.kind);
+    try std.testing.expectEqual(@as(u32, 9), cfg.memory.search.store.ann_candidate_multiplier);
+    try std.testing.expectEqual(@as(u32, 77), cfg.memory.search.store.ann_min_candidates);
+}
+
+test "json parse memory sqlite_ann store options clamp and ignore invalid integers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"memory":{"search":{"store":{"kind":"sqlite_ann","ann_candidate_multiplier":-5,"ann_min_candidates":5000000000}}}}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("sqlite_ann", cfg.memory.search.store.kind);
+    try std.testing.expectEqual(@as(u32, 12), cfg.memory.search.store.ann_candidate_multiplier);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), cfg.memory.search.store.ann_min_candidates);
+}
+
 test "save roundtrip preserves extended config sections" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1618,6 +1660,10 @@ test "save roundtrip preserves extended config sections" {
     cfg.security.audit.log_path = "custom.log";
     cfg.security.audit.max_size_mb = 9;
     cfg.security.audit.sign_events = true;
+    cfg.security.audit.capture_shell_output = true;
+    cfg.security.audit.max_output_bytes = 1024;
+    cfg.security.audit.capture_tool_output = true;
+    cfg.security.audit.max_tool_output_bytes = 384;
 
     cfg.peripherals.enabled = true;
     cfg.peripherals.datasheet_dir = "/tmp/ds";
@@ -1692,6 +1738,10 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("aieos", loaded.identity.format);
     try std.testing.expectEqual(@as(u8, 70), loaded.cost.warn_at_percent);
     try std.testing.expectEqual(config_types.SandboxBackend.firejail, loaded.security.sandbox.backend);
+    try std.testing.expect(loaded.security.audit.capture_shell_output);
+    try std.testing.expectEqual(@as(u32, 1024), loaded.security.audit.max_output_bytes);
+    try std.testing.expect(loaded.security.audit.capture_tool_output);
+    try std.testing.expectEqual(@as(u32, 384), loaded.security.audit.max_tool_output_bytes);
     try std.testing.expect(loaded.peripherals.enabled);
     try std.testing.expectEqualStrings("/dev/tty.usbmodem1", loaded.hardware.serial_port.?);
     try std.testing.expectEqual(config_types.DmScope.per_peer, loaded.session.dm_scope);
@@ -2390,6 +2440,10 @@ test "json parse security section" {
     try std.testing.expectEqual(@as(u64, 120), cfg.security.resources.max_cpu_time_seconds);
     try std.testing.expect(!cfg.security.audit.enabled);
     try std.testing.expectEqualStrings("custom.log", cfg.security.audit.log_path);
+    try std.testing.expect(!cfg.security.audit.capture_shell_output);
+    try std.testing.expectEqual(@as(u32, 2048), cfg.security.audit.max_output_bytes);
+    try std.testing.expect(!cfg.security.audit.capture_tool_output);
+    try std.testing.expectEqual(@as(u32, 512), cfg.security.audit.max_tool_output_bytes);
     allocator.free(cfg.security.audit.log_path);
 }
 
@@ -2453,6 +2507,16 @@ test "json parse autonomy allowed_paths" {
     try std.testing.expectEqualStrings("/tmp/scratch", cfg.autonomy.allowed_paths[1]);
     for (cfg.autonomy.allowed_paths) |p| allocator.free(p);
     allocator.free(cfg.autonomy.allowed_paths);
+}
+
+test "json parse autonomy allow_raw_url_chars" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"autonomy": {"allow_raw_url_chars": true}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.autonomy.allow_raw_url_chars);
 }
 
 test "json parse gateway paired tokens" {
@@ -2993,6 +3057,33 @@ test "json parse providers section" {
     try std.testing.expectEqualStrings("https://custom.groq.dev", cfg.getProviderBaseUrl("groq").?);
     try std.testing.expect(cfg.getProviderBaseUrl("openrouter") == null);
     // Cleanup
+    for (cfg.providers) |e| {
+        allocator.free(e.name);
+        if (e.api_key) |k| allocator.free(k);
+        if (e.base_url) |b| allocator.free(b);
+        if (e.user_agent) |ua| allocator.free(ua);
+    }
+    allocator.free(cfg.providers);
+}
+
+test "json parse providers section accepts object api_key" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"models":{"providers":{"vertex":{"api_key":{"type":"service_account","project_id":"proj-obj","client_email":"svc@proj-obj.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----\\n"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    const key = cfg.getProviderKey("vertex") orelse return error.TestExpectedEqual;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, key, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("service_account", obj.get("type").?.string);
+    try std.testing.expectEqualStrings("proj-obj", obj.get("project_id").?.string);
+    try std.testing.expectEqualStrings("svc@proj-obj.iam.gserviceaccount.com", obj.get("client_email").?.string);
+
     for (cfg.providers) |e| {
         allocator.free(e.name);
         if (e.api_key) |k| allocator.free(k);
@@ -3764,6 +3855,28 @@ test "json parse reasoning_effort low" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("low", cfg.reasoning_effort.?);
+    allocator.free(cfg.reasoning_effort.?);
+}
+
+test "json parse reasoning_effort minimal" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"reasoning_effort": "minimal"}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("minimal", cfg.reasoning_effort.?);
+    allocator.free(cfg.reasoning_effort.?);
+}
+
+test "json parse reasoning_effort xhigh" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"reasoning_effort": "xhigh"}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("xhigh", cfg.reasoning_effort.?);
     allocator.free(cfg.reasoning_effort.?);
 }
 

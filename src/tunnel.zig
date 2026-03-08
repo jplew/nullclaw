@@ -181,6 +181,53 @@ fn extractUrl(output: []const u8) ?[]const u8 {
     return null;
 }
 
+const URL_READ_BUFFER_BYTES: usize = 64 * 1024;
+const URL_READ_TIMEOUT_DEFAULT_NS: u64 = 30 * std.time.ns_per_s;
+const URL_READ_TIMEOUT_CUSTOM_NS: u64 = 90 * std.time.ns_per_s;
+const URL_READ_POLL_STEP_NS: u64 = 200 * std.time.ns_per_ms;
+
+fn tryReadUrlFromPipe(allocator: std.mem.Allocator, pipe: std.fs.File, timeout_ns: u64) ?[]const u8 {
+    var poller = std.Io.poll(allocator, enum { pipe }, .{
+        .pipe = pipe,
+    });
+    defer poller.deinit();
+
+    const pipe_reader = poller.reader(.pipe);
+    // Reader buffer is owned/freed by poller.deinit(); keep it heap-managed.
+    pipe_reader.buffer = &.{};
+    pipe_reader.seek = 0;
+    pipe_reader.end = 0;
+
+    const started_at_ns = std.time.nanoTimestamp();
+    while (true) {
+        const keep_polling = poller.pollTimeout(URL_READ_POLL_STEP_NS) catch return null;
+
+        const output = pipe_reader.buffer[0..pipe_reader.end];
+        if (extractUrl(output)) |found_url| {
+            return allocator.dupe(u8, found_url) catch null;
+        }
+
+        if (output.len > URL_READ_BUFFER_BYTES) return null;
+        if (!keep_polling) return null;
+
+        const elapsed_ns: i128 = std.time.nanoTimestamp() - started_at_ns;
+        if (elapsed_ns >= @as(i128, timeout_ns)) return null;
+    }
+}
+
+fn detachChildArgv(child: *std.process.Child) void {
+    // argv backing storage can be stack/local; drop references after successful spawn.
+    child.argv = &.{};
+}
+
+fn cleanupFailedStart(child: *?std.process.Child, state: *TunnelState) void {
+    if (child.*) |*running_child| {
+        _ = running_child.kill() catch {};
+    }
+    child.* = null;
+    state.* = .error_state;
+}
+
 // ── CloudflareTunnel ────────────────────────────────────────────
 
 /// Cloudflare Tunnel -- wraps the `cloudflared` binary.
@@ -234,28 +281,19 @@ pub const CloudflareTunnel = struct {
         child.stderr_behavior = .Pipe;
 
         child.spawn() catch return TunnelAdapter.TunnelError.ProcessSpawnFailed;
+        detachChildArgv(&child);
         self.child = child;
 
-        // Read stderr to find the public URL (cloudflared prints it there)
+        // Read stderr for a bounded time to find the public URL.
         if (self.child.?.stderr) |*stderr| {
-            const output = stderr.readToEndAlloc(self.allocator, 64 * 1024) catch {
-                self.state = .error_state;
-                return TunnelAdapter.TunnelError.StartFailed;
-            };
-            defer self.allocator.free(output);
-
-            if (extractUrl(output)) |found_url| {
-                self.url = self.allocator.dupe(u8, found_url) catch {
-                    self.state = .error_state;
-                    return TunnelAdapter.TunnelError.StartFailed;
-                };
+            if (tryReadUrlFromPipe(self.allocator, stderr.*, URL_READ_TIMEOUT_DEFAULT_NS)) |found_url| {
+                self.url = found_url;
                 self.state = .running;
-                return self.url.?;
+                return found_url;
             }
         }
 
-        // If we got here with a running process but no URL, still mark running
-        self.state = .running;
+        cleanupFailedStart(&self.child, &self.state);
         self.url = null;
         return TunnelAdapter.TunnelError.UrlNotFound;
     }
@@ -359,27 +397,19 @@ pub const NgrokTunnel = struct {
         child.stderr_behavior = .Pipe;
 
         child.spawn() catch return TunnelAdapter.TunnelError.ProcessSpawnFailed;
+        detachChildArgv(&child);
         self.child = child;
 
-        // Read stdout for url= pattern (ngrok logfmt output)
+        // Read stdout for a bounded time to find ngrok's public URL.
         if (self.child.?.stdout) |*stdout| {
-            const output = stdout.readToEndAlloc(self.allocator, 64 * 1024) catch {
-                self.state = .error_state;
-                return TunnelAdapter.TunnelError.StartFailed;
-            };
-            defer self.allocator.free(output);
-
-            if (extractUrl(output)) |found_url| {
-                self.url = self.allocator.dupe(u8, found_url) catch {
-                    self.state = .error_state;
-                    return TunnelAdapter.TunnelError.StartFailed;
-                };
+            if (tryReadUrlFromPipe(self.allocator, stdout.*, URL_READ_TIMEOUT_DEFAULT_NS)) |found_url| {
+                self.url = found_url;
                 self.state = .running;
-                return self.url.?;
+                return found_url;
             }
         }
 
-        self.state = .running;
+        cleanupFailedStart(&self.child, &self.state);
         self.url = null;
         return TunnelAdapter.TunnelError.UrlNotFound;
     }
@@ -459,6 +489,7 @@ pub const TailscaleTunnel = struct {
         child.stderr_behavior = .Pipe;
 
         child.spawn() catch return TunnelAdapter.TunnelError.ProcessSpawnFailed;
+        detachChildArgv(&child);
         self.child = child;
 
         // Construct URL from hostname
@@ -476,25 +507,16 @@ pub const TailscaleTunnel = struct {
             return self.url.?;
         }
 
-        // No hostname provided -- read stdout for URL output
+        // No hostname provided -- read stdout for a bounded time.
         if (self.child.?.stdout) |*stdout| {
-            const output = stdout.readToEndAlloc(self.allocator, 64 * 1024) catch {
-                self.state = .error_state;
-                return TunnelAdapter.TunnelError.StartFailed;
-            };
-            defer self.allocator.free(output);
-
-            if (extractUrl(output)) |found_url| {
-                self.url = self.allocator.dupe(u8, found_url) catch {
-                    self.state = .error_state;
-                    return TunnelAdapter.TunnelError.StartFailed;
-                };
+            if (tryReadUrlFromPipe(self.allocator, stdout.*, URL_READ_TIMEOUT_DEFAULT_NS)) |found_url| {
+                self.url = found_url;
                 self.state = .running;
-                return self.url.?;
+                return found_url;
             }
         }
 
-        self.state = .running;
+        cleanupFailedStart(&self.child, &self.state);
         self.url = null;
         return TunnelAdapter.TunnelError.UrlNotFound;
     }
@@ -604,27 +626,19 @@ pub const CustomTunnel = struct {
         child.stderr_behavior = .Pipe;
 
         child.spawn() catch return TunnelAdapter.TunnelError.ProcessSpawnFailed;
+        detachChildArgv(&child);
         self.child = child;
 
-        // Read stdout to find URL
+        // Read stdout for a bounded time to discover the public URL.
         if (self.child.?.stdout) |*stdout| {
-            const output = stdout.readToEndAlloc(self.allocator, 64 * 1024) catch {
-                self.state = .error_state;
-                return TunnelAdapter.TunnelError.StartFailed;
-            };
-            defer self.allocator.free(output);
-
-            if (extractUrl(output)) |found_url| {
-                self.url = self.allocator.dupe(u8, found_url) catch {
-                    self.state = .error_state;
-                    return TunnelAdapter.TunnelError.StartFailed;
-                };
+            if (tryReadUrlFromPipe(self.allocator, stdout.*, URL_READ_TIMEOUT_CUSTOM_NS)) |found_url| {
+                self.url = found_url;
                 self.state = .running;
-                return self.url.?;
+                return found_url;
             }
         }
 
-        self.state = .running;
+        cleanupFailedStart(&self.child, &self.state);
         self.url = null;
         return TunnelAdapter.TunnelError.UrlNotFound;
     }
@@ -717,17 +731,18 @@ pub const Tunnel = struct {
                 child.stderr_behavior = .Pipe;
 
                 child.spawn() catch return error.NotImplemented;
+                detachChildArgv(&child);
                 self.child = child;
-                self.state = .running;
 
                 if (self.child.?.stderr) |*stderr| {
-                    const output = stderr.readToEndAlloc(alloc, 64 * 1024) catch return error.NotImplemented;
-                    defer alloc.free(output);
-                    if (extractUrl(output)) |found| {
-                        self.public_url = try alloc.dupe(u8, found);
+                    if (tryReadUrlFromPipe(alloc, stderr.*, URL_READ_TIMEOUT_DEFAULT_NS)) |found| {
+                        self.public_url = found;
+                        self.state = .running;
                         return self.public_url.?;
                     }
                 }
+                cleanupFailedStart(&self.child, &self.state);
+                self.public_url = null;
                 return error.NotImplemented;
             },
             .ngrok => {
@@ -767,17 +782,18 @@ pub const Tunnel = struct {
                 child.stderr_behavior = .Pipe;
 
                 child.spawn() catch return error.NotImplemented;
+                detachChildArgv(&child);
                 self.child = child;
-                self.state = .running;
 
                 if (self.child.?.stdout) |*stdout| {
-                    const output = stdout.readToEndAlloc(alloc, 64 * 1024) catch return error.NotImplemented;
-                    defer alloc.free(output);
-                    if (extractUrl(output)) |found| {
-                        self.public_url = try alloc.dupe(u8, found);
+                    if (tryReadUrlFromPipe(alloc, stdout.*, URL_READ_TIMEOUT_DEFAULT_NS)) |found| {
+                        self.public_url = found;
+                        self.state = .running;
                         return self.public_url.?;
                     }
                 }
+                cleanupFailedStart(&self.child, &self.state);
+                self.public_url = null;
                 return error.NotImplemented;
             },
             .tailscale => {
@@ -793,15 +809,18 @@ pub const Tunnel = struct {
                 child.stderr_behavior = .Pipe;
 
                 child.spawn() catch return error.NotImplemented;
+                detachChildArgv(&child);
                 self.child = child;
-                self.state = .running;
 
                 if (self.tailscale_hostname) |h| {
                     var tbuf: [256]u8 = undefined;
                     const constructed = std.fmt.bufPrint(&tbuf, "https://{s}", .{h}) catch return error.NotImplemented;
                     self.public_url = try alloc.dupe(u8, constructed);
+                    self.state = .running;
                     return self.public_url.?;
                 }
+                cleanupFailedStart(&self.child, &self.state);
+                self.public_url = null;
                 return error.NotImplemented;
             },
             .custom => {
@@ -830,17 +849,18 @@ pub const Tunnel = struct {
                 child.stderr_behavior = .Pipe;
 
                 child.spawn() catch return error.NotImplemented;
+                detachChildArgv(&child);
                 self.child = child;
-                self.state = .running;
 
                 if (self.child.?.stdout) |*stdout| {
-                    const output = stdout.readToEndAlloc(alloc, 64 * 1024) catch return error.NotImplemented;
-                    defer alloc.free(output);
-                    if (extractUrl(output)) |found| {
-                        self.public_url = try alloc.dupe(u8, found);
+                    if (tryReadUrlFromPipe(alloc, stdout.*, URL_READ_TIMEOUT_CUSTOM_NS)) |found| {
+                        self.public_url = found;
+                        self.state = .running;
                         return self.public_url.?;
                     }
                 }
+                cleanupFailedStart(&self.child, &self.state);
+                self.public_url = null;
                 return error.NotImplemented;
             },
         }
@@ -1063,6 +1083,29 @@ test "extractUrl returns null for no url" {
 test "extractUrl ignores bare https://" {
     const output = "https:// \nnothing";
     try std.testing.expect(extractUrl(output) == null);
+}
+
+test "tryReadUrlFromPipe extracts URL from stream" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const log_name = "tunnel.log";
+    {
+        const log_file = try tmp.dir.createFile(log_name, .{});
+        defer log_file.close();
+        try log_file.writeAll("booting\nhttps://abc123.trycloudflare.com connected\n");
+    }
+
+    const read_file = try tmp.dir.openFile(log_name, .{});
+    defer read_file.close();
+
+    const url = tryReadUrlFromPipe(std.testing.allocator, read_file, std.time.ns_per_s) orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expectEqualStrings("https://abc123.trycloudflare.com", url);
 }
 
 // ── TunnelAdapter vtable tests ──────────────────────────────────
