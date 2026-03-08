@@ -14,6 +14,7 @@ pub const RunResult = struct {
     success: bool,
     exit_code: ?u32 = null,
     interrupted: bool = false,
+    timed_out: bool = false,
 
     /// Free both stdout and stderr buffers.
     pub fn deinit(self: *const RunResult, allocator: std.mem.Allocator) void {
@@ -28,23 +29,39 @@ pub const RunOptions = struct {
     env_map: ?*std.process.EnvMap = null,
     max_output_bytes: usize = 1_048_576,
     cancel_flag: ?*const AtomicBool = null,
+    timeout_ns: ?u64 = null,
 };
 
-const CancelWatcherCtx = struct {
+const TerminationWatcherCtx = struct {
     child: *std.process.Child,
-    cancel_flag: *const AtomicBool,
+    cancel_flag: ?*const AtomicBool,
+    timeout_deadline_ns: ?i128,
     done: *AtomicBool,
+    timed_out: *AtomicBool,
 };
 
-fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
+fn terminateChild(child: *std.process.Child) void {
+    if (comptime @import("builtin").os.tag == .windows) {
+        std.os.windows.TerminateProcess(child.id, 1) catch {};
+    } else {
+        std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
+    }
+}
+
+fn terminationWatcherMain(ctx: *TerminationWatcherCtx) void {
     while (!ctx.done.load(.acquire)) {
-        if (ctx.cancel_flag.load(.acquire)) {
-            if (comptime @import("builtin").os.tag == .windows) {
-                std.os.windows.TerminateProcess(ctx.child.id, 1) catch {};
-            } else {
-                std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
+        if (ctx.cancel_flag) |cancel_flag| {
+            if (cancel_flag.load(.acquire)) {
+                terminateChild(ctx.child);
+                break;
             }
-            break;
+        }
+        if (ctx.timeout_deadline_ns) |deadline_ns| {
+            if (std.time.nanoTimestamp() >= deadline_ns) {
+                ctx.timed_out.store(true, .release);
+                terminateChild(ctx.child);
+                break;
+            }
         }
         std.Thread.sleep(20 * std.time.ns_per_ms);
     }
@@ -60,6 +77,7 @@ pub fn run(
     opts: RunOptions,
 ) !RunResult {
     var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
     if (opts.cwd) |cwd| child.cwd = cwd;
@@ -68,44 +86,51 @@ pub fn run(
     try child.spawn();
 
     const effective_cancel_flag = opts.cancel_flag orelse thread_interrupt_flag;
+    const timeout_deadline_ns: ?i128 = if (opts.timeout_ns) |timeout_ns|
+        std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns))
+    else
+        null;
     var cancel_done = AtomicBool.init(false);
-    var cancel_watcher: ?std.Thread = null;
-    var watcher_ctx: CancelWatcherCtx = undefined;
-    if (effective_cancel_flag) |flag| {
+    var timed_out = AtomicBool.init(false);
+    var termination_watcher: ?std.Thread = null;
+    var watcher_ctx: TerminationWatcherCtx = undefined;
+    if (effective_cancel_flag != null or timeout_deadline_ns != null) {
         watcher_ctx = .{
             .child = &child,
-            .cancel_flag = flag,
+            .cancel_flag = effective_cancel_flag,
+            .timeout_deadline_ns = timeout_deadline_ns,
             .done = &cancel_done,
+            .timed_out = &timed_out,
         };
-        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
+        termination_watcher = std.Thread.spawn(.{}, terminationWatcherMain, .{&watcher_ctx}) catch null;
     }
     defer {
         cancel_done.store(true, .release);
-        if (cancel_watcher) |t| t.join();
+        if (termination_watcher) |t| t.join();
     }
 
-    const stdout = if (child.stdout) |stdout_file| blk: {
-        break :blk stdout_file.readToEndAlloc(allocator, opts.max_output_bytes) catch |err| {
-            if (effective_cancel_flag != null and effective_cancel_flag.?.load(.acquire)) {
-                break :blk try allocator.dupe(u8, "");
-            }
-            return err;
-        };
-    } else try allocator.dupe(u8, "");
-    errdefer allocator.free(stdout);
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
 
-    const stderr = if (child.stderr) |stderr_file| blk: {
-        break :blk stderr_file.readToEndAlloc(allocator, opts.max_output_bytes) catch |err| {
-            if (effective_cancel_flag != null and effective_cancel_flag.?.load(.acquire)) {
-                break :blk try allocator.dupe(u8, "");
-            }
+    std.process.Child.collectOutput(child, allocator, &stdout_buf, &stderr_buf, opts.max_output_bytes) catch |err| {
+        const canceled = effective_cancel_flag != null and effective_cancel_flag.?.load(.acquire);
+        if (canceled or timed_out.load(.acquire)) {
+            // Process was intentionally terminated; swallow stream read errors.
+        } else {
             return err;
-        };
-    } else try allocator.dupe(u8, "");
+        }
+    };
+
+    const stdout = try stdout_buf.toOwnedSlice(allocator);
+    errdefer allocator.free(stdout);
+    const stderr = try stderr_buf.toOwnedSlice(allocator);
     errdefer allocator.free(stderr);
 
     const term = try child.wait();
     const interrupted = if (effective_cancel_flag) |flag| flag.load(.acquire) else false;
+    const was_timed_out = timed_out.load(.acquire);
 
     return switch (term) {
         .Exited => |code| .{
@@ -114,6 +139,7 @@ pub fn run(
             .success = code == 0,
             .exit_code = code,
             .interrupted = interrupted,
+            .timed_out = was_timed_out,
         },
         else => .{
             .stdout = stdout,
@@ -121,6 +147,7 @@ pub fn run(
             .success = false,
             .exit_code = null,
             .interrupted = interrupted,
+            .timed_out = was_timed_out,
         },
     };
 }
@@ -200,6 +227,19 @@ test "run honors cancel flag and interrupts child" {
     defer result.deinit(allocator);
     try std.testing.expect(!result.success);
     try std.testing.expect(result.interrupted);
+}
+
+test "run honors timeout and terminates child" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const result = try run(allocator, &.{ "sh", "-c", "sleep 5; echo done" }, .{
+        .timeout_ns = 150 * std.time.ns_per_ms,
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.timed_out);
 }
 
 test "RunResult deinit frees buffers" {

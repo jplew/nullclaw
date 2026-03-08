@@ -139,6 +139,7 @@ pub const ShellTool = struct {
             .cwd = effective_cwd,
             .env_map = &env,
             .max_output_bytes = self.max_output_bytes,
+            .timeout_ns = self.timeout_ns,
         });
         defer allocator.free(result.stderr);
         const elapsed_ms = elapsedMillis(started_ms);
@@ -174,6 +175,15 @@ pub const ShellTool = struct {
         defer allocator.free(result.stdout);
         if (result.interrupted) {
             return ToolResult{ .success = false, .output = "", .error_msg = "Interrupted by /stop" };
+        }
+        if (result.timed_out) {
+            const timeout_secs = self.timeout_ns / std.time.ns_per_s;
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "Command timed out after {d} second{s}",
+                .{ timeout_secs, if (timeout_secs == 1) "" else "s" },
+            );
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
         }
         if (result.exit_code != null) {
             const err_out = try allocator.dupe(u8, if (result.stderr.len > 0) result.stderr else "Command failed with non-zero exit code");
@@ -352,6 +362,26 @@ test "shell reports interruption when cancel flag is set" {
     try std.testing.expect(!result.success);
     try std.testing.expect(result.error_msg != null);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Interrupted") != null);
+}
+
+test "shell times out long-running command" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var st = ShellTool{
+        .workspace_dir = ".",
+        .timeout_ns = 200 * std.time.ns_per_ms,
+    };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"command\": \"sleep 5\"}");
+    defer parsed.deinit();
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "timed out") != null);
 }
 
 test "shell missing command param" {
